@@ -1,0 +1,3 @@
+# Every file is kept byte for byte: cargo checks the vendored crates in dependencies/ against
+# their checksums, and a changed line ending fails that check.
+* -text

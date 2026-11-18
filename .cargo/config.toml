@@ -1,0 +1,9 @@
+[build]
+target = "aarch64-linux-android"
+target-dir = "build"
+
+[source.crates-io]
+replace-with = "dependencies"
+
+[source.dependencies]
+directory = "dependencies"
