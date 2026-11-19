@@ -1,12 +1,26 @@
+//! Drawing. [`Graphics::create`] picks a graphics API for the window, and the [`Graphics`] it
+//! returns runs the frames: input in, egui's picture out to the window.
+
 #[cfg(target_os = "android")]
 mod opengl;
 mod software;
+mod texture;
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 mod vulkan;
 
+use egui::TextureId;
+
+#[cfg(target_os = "android")]
+pub use android::Graphics;
+#[cfg(target_os = "android")]
+pub(crate) use android::{Backend, Frame};
+pub use texture::Texture;
+
+/// The graphics API to draw with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Backend {
+pub enum GraphicsApi {
+    /// The first that works: OpenGL ES, then Vulkan, then the CPU.
     #[default]
     Auto,
     Software,
@@ -14,7 +28,7 @@ pub enum Backend {
     Vulkan,
 }
 
-impl Backend {
+impl GraphicsApi {
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
@@ -25,7 +39,7 @@ impl Backend {
         }
     }
 
-    /// The backends to try, best first.
+    /// The APIs to try, best first.
     pub(crate) fn candidates(self) -> &'static [Self] {
         match self {
             Self::Auto => &[Self::OpenGl, Self::Vulkan, Self::Software],
@@ -36,37 +50,360 @@ impl Backend {
     }
 }
 
-#[cfg(target_os = "android")]
-pub(crate) use android::{Frame, Graphics, create};
+/// A texture's id as one number, for the hashes that tell a changed picture from an unchanged one.
+pub(crate) fn texture_key(id: TextureId) -> u64 {
+    match id {
+        TextureId::Managed(id) => id << 1,
+        TextureId::User(id) => id << 1 | 1,
+    }
+}
 
 #[cfg(target_os = "android")]
 mod android {
-    use egui::{ClippedPrimitive, TexturesDelta};
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
-    use super::{Backend, opengl, software, vulkan};
-    use crate::Result;
-    use crate::window::NativeWindow;
+    use egui::epaint::Primitive;
+    use egui::{ClippedPrimitive, Context, Pos2, RawInput, Rect, TexturesDelta, ViewportCommand, ViewportId, vec2};
+
+    use super::texture::{self, Texture};
+    use super::{GraphicsApi, opengl, software, texture_key, vsync, vulkan};
+    use crate::input::{self, Feed};
+    use crate::utils::{self, HASH_SEED};
+    use crate::window::{ANativeWindow, Display, NativeWindow};
+    use crate::{Result, err};
+
+    const IDLE_POLL: Duration = Duration::from_millis(250);
 
     pub struct Frame<'a> {
-        pub window: &'a NativeWindow,
+        pub window: &'a ANativeWindow,
         pub size: [u32; 2],
         pub pixels_per_point: f32,
         pub primitives: &'a [ClippedPrimitive],
         pub textures: &'a mut TexturesDelta,
     }
 
-    pub trait Graphics {
+    /// One graphics API, drawing egui's picture into the window.
+    pub trait Backend {
         fn name(&self) -> &'static str;
         fn max_texture_side(&self) -> usize;
-        fn rebind(&mut self, window: &NativeWindow) -> Result<()>;
+        fn rebind(&mut self, window: &ANativeWindow) -> Result<()>;
         fn render(&mut self, frame: Frame) -> Result<()>;
     }
 
-    pub fn create(backend: Backend, window: &NativeWindow) -> Result<Box<dyn Graphics>> {
-        match backend {
-            Backend::Auto | Backend::OpenGl => Ok(Box::new(opengl::OpenGl::new(window)?)),
-            Backend::Software => Ok(Box::new(software::Software::new())),
-            Backend::Vulkan => Ok(Box::new(vulkan::Vulkan::new(window)?)),
+    /// Brings up the first backend that works. Each attempt gets a layer of its own: a window that
+    /// one graphics API has claimed is not given up to another.
+    fn start(window: &NativeWindow, api: GraphicsApi) -> Result<Rc<RefCell<dyn Backend>>> {
+        let mut failure = err!("no graphics backend to try");
+        for &candidate in api.candidates() {
+            window.fresh_layer()?;
+            match window.with_native(|native| backend(candidate, native)) {
+                Ok(backend) => return Ok(backend),
+                Err(error) => {
+                    log::warn!("{candidate:?} backend is unavailable: {error}");
+                    failure = error;
+                }
+            }
         }
+        Err(failure)
+    }
+
+    fn backend(api: GraphicsApi, window: &ANativeWindow) -> Result<Rc<RefCell<dyn Backend>>> {
+        match api {
+            GraphicsApi::Auto | GraphicsApi::OpenGl => Ok(Rc::new(RefCell::new(opengl::OpenGl::new(window)?))),
+            GraphicsApi::Software => Ok(Rc::new(RefCell::new(software::Software::new()))),
+            GraphicsApi::Vulkan => Ok(Rc::new(RefCell::new(vulkan::Vulkan::new(window)?))),
+        }
+    }
+
+    /// The graphics of an overlay: the egui context and the frame loop, input in and egui's
+    /// picture out to the window. Without [`crate::Touch::init`] frames get no input, and one is
+    /// drawn only when the interface asks to be repainted.
+    pub struct Graphics {
+        context: Context,
+        backend: Rc<RefCell<dyn Backend>>,
+        name: &'static str,
+        max_texture_side: usize,
+        window: NativeWindow,
+        /// The window's count of layer changes that the picture has caught up with.
+        changes: u64,
+        started: Instant,
+        time: f64,
+        polled: Instant,
+        frame_at: Instant,
+        repaint: Option<Instant>,
+        fingerprint: u64,
+        running: bool,
+        input: Option<Feed>,
+    }
+
+    impl Graphics {
+        /// Starts drawing into the window with the graphics API asked for. The second of the
+        /// three steps that bring an overlay up; [`crate::Touch::init`] is the third.
+        pub fn create(window: &NativeWindow, api: GraphicsApi) -> Result<Self> {
+            let backend = start(window, api)?;
+            window.bind(&backend);
+            let (name, max_texture_side) = (backend.borrow().name(), backend.borrow().max_texture_side());
+            let display = window.display();
+            log::info!("{}x{} at {} degrees, Android API {}, {name}", display.width, display.height, display.rotation.degrees(), window.api_level());
+            let now = Instant::now();
+            Ok(Self {
+                context: Context::default(),
+                backend,
+                name,
+                max_texture_side,
+                window: window.clone(),
+                changes: window.changes(),
+                started: now,
+                time: 0.0,
+                polled: now,
+                frame_at: now.checked_sub(IDLE_POLL).unwrap_or(now),
+                repaint: Some(now),
+                fingerprint: 0,
+                running: true,
+                input: None,
+            })
+        }
+
+        pub fn run(mut self, mut ui: impl FnMut(&mut egui::Ui)) -> Result<()> {
+            while self.frame(&mut ui)? {}
+            Ok(())
+        }
+
+        /// Runs one frame. Returns `false` once the overlay has been asked to close.
+        pub fn frame(&mut self, mut ui: impl FnMut(&mut egui::Ui)) -> Result<bool> {
+            self.wait()?;
+            if !self.running {
+                return Ok(false);
+            }
+
+            let display = self.window.display();
+            let raw = self.take_input(display);
+            let mut unused = Rect::NOTHING;
+            let input = &self.input;
+            let mut output = self.context.run_ui(raw, |root| {
+                ui(root);
+                unused = root.available_rect_before_wrap();
+                if let Some(input) = input {
+                    input.paint(root.ctx());
+                }
+            });
+            if let Some(viewport) = output.viewport_output.get(&ViewportId::ROOT) {
+                self.repaint = Instant::now().checked_add(viewport.repaint_delay);
+                self.running &= !viewport.commands.contains(&ViewportCommand::Close);
+            }
+            if let Some(input) = &mut self.input {
+                if input.finish(&self.context, &mut output.platform_output) {
+                    self.repaint = Some(Instant::now());
+                }
+                input.publish(&self.context, display, unused, output.pixels_per_point);
+            }
+
+            let primitives = self.context.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+            let size = [display.width, display.height];
+            let fingerprint = fingerprint(&primitives, size);
+            if fingerprint != self.fingerprint || !output.textures_delta.is_empty() {
+                let (backend, pixels_per_point, textures) = (&self.backend, output.pixels_per_point, &mut output.textures_delta);
+                self.window.with_native(|window| backend.borrow_mut().render(Frame { window, size, pixels_per_point, primitives: &primitives, textures }))?;
+                self.fingerprint = fingerprint;
+            }
+
+            self.window.set_visible(!primitives.is_empty())?;
+            Ok(self.running)
+        }
+
+        pub fn context(&self) -> &Context {
+            &self.context
+        }
+
+        /// The graphics API in use, by name.
+        pub fn name(&self) -> &'static str {
+            self.name
+        }
+
+        pub fn close(&mut self) {
+            self.running = false;
+        }
+
+        /// Loads a PNG or JPEG picture, to be shown with `ui.image` or drawn by a painter with
+        /// `painter.image(texture.id(), ..)`.
+        /// `name` tells the picture from others in messages.
+        pub fn load_image(&self, name: &str, data: &[u8]) -> Result<Texture> {
+            let (size, pixels) = texture::decode(name, data)?;
+            self.load_pixels(name, size, &pixels)
+        }
+
+        /// Loads a PNG or JPEG picture from a file.
+        pub fn load_image_file(&self, path: impl AsRef<Path>) -> Result<Texture> {
+            let path = path.as_ref();
+            self.load_image(&path.to_string_lossy(), &utils::read_file(path)?)
+        }
+
+        /// Loads a picture from RGBA pixels, four bytes each, row after row from the top.
+        pub fn load_pixels(&self, name: &str, size: [usize; 2], rgba: &[u8]) -> Result<Texture> {
+            texture::load(&self.context, name, size, rgba, self.max_texture_side)
+        }
+
+        pub(crate) fn window(&self) -> &NativeWindow {
+            &self.window
+        }
+
+        pub(crate) fn has_input(&self) -> bool {
+            self.input.is_some()
+        }
+
+        /// Gives the frames their input from now on.
+        pub(crate) fn set_input(&mut self, input: Feed) {
+            self.input = Some(input);
+        }
+
+        fn take_input(&mut self, display: Display) -> RawInput {
+            let zoom = self.context.zoom_factor();
+            let scale = 1.0 / (display.density * zoom);
+            let happened = self.input.as_mut().and_then(Feed::take).map(|at| at.saturating_duration_since(self.started).as_secs_f64());
+            self.time = input::frame_time(self.time, happened, self.started.elapsed().as_secs_f64());
+
+            let viewport = Rect::from_min_size(Pos2::ZERO, vec2(display.width as f32, display.height as f32) * scale);
+            let mut events = Vec::new();
+            if let Some(input) = &mut self.input {
+                input.events(self.time, scale, viewport, zoom, &mut events);
+            }
+            let mut raw =
+                RawInput { screen_rect: Some(viewport), max_texture_side: Some(self.max_texture_side), time: Some(self.time), focused: true, events, ..Default::default() };
+            raw.viewports.entry(ViewportId::ROOT).or_default().native_pixels_per_point = Some(display.density);
+            raw
+        }
+
+        fn wait(&mut self) -> Result<()> {
+            // Frames follow the display's refresh, and where that is not known they come four
+            // milliseconds apart at the least.
+            let earliest = self.frame_at + vsync::period().or(self.window.refresh_period()).unwrap_or(Duration::from_millis(4));
+            let mut pending = false;
+            loop {
+                let now = Instant::now();
+                // Ten times a second the display is asked whether it was turned or resized.
+                if now.duration_since(self.polled) >= Duration::from_millis(100) {
+                    if let Some(input) = &mut self.input {
+                        input.rest();
+                    }
+                    pending |= self.follow_display()?;
+                }
+                // A layer that was replaced or resized is empty: it gets a frame at once, and
+                // the frame is drawn whether or not the picture has changed.
+                let changes = self.window.changes();
+                if changes != self.changes {
+                    (self.changes, self.fingerprint, self.repaint) = (changes, 0, Some(now));
+                }
+                let due = if pending { Some(earliest) } else { self.repaint.map(|at| at.max(earliest)) };
+                let pause = due.map_or(IDLE_POLL, |at| at.saturating_duration_since(now)).min(IDLE_POLL);
+                if pause.is_zero() {
+                    break;
+                }
+                match &self.input {
+                    Some(input) if !pending => pending = input.wait(pause),
+                    _ => std::thread::sleep(pause),
+                }
+            }
+            self.frame_at = Instant::now();
+            Ok(())
+        }
+
+        fn follow_display(&mut self) -> Result<bool> {
+            self.polled = Instant::now();
+            if !self.window.follow_display()? {
+                return Ok(false);
+            }
+            self.context.request_repaint();
+            Ok(true)
+        }
+    }
+
+    impl Drop for Graphics {
+        /// The picture leaves the screen before anything else is wound up: the helpers that
+        /// input has started take a moment to go.
+        fn drop(&mut self) {
+            let _ = self.window.set_visible(false);
+        }
+    }
+
+    fn fingerprint(primitives: &[ClippedPrimitive], size: [u32; 2]) -> u64 {
+        let mut hash = HASH_SEED ^ (u64::from(size[0]) << 32 | u64::from(size[1]));
+        let mut mix = |bytes: &[u8]| hash = utils::mix_bytes(hash, bytes);
+        for clipped in primitives {
+            if let Primitive::Mesh(mesh) = &clipped.primitive {
+                mix(bytemuck::bytes_of(&[clipped.clip_rect.min.x, clipped.clip_rect.min.y, clipped.clip_rect.max.x, clipped.clip_rect.max.y]));
+                mix(&texture_key(mesh.texture_id).to_le_bytes());
+                mix(bytemuck::cast_slice(&mesh.indices));
+                mix(bytemuck::cast_slice(&mesh.vertices));
+            }
+        }
+        hash
+    }
+}
+
+/// The display's refresh period as the NDK's choreographer reports it.
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+mod vsync {
+    use std::ffi::{c_int, c_void};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use crate::utils::{self, Library};
+
+    static PERIOD_NANOS: AtomicU64 = AtomicU64::new(0);
+
+    type Prepare = unsafe extern "C" fn(c_int) -> *mut c_void;
+    type PollOnce = unsafe extern "C" fn(c_int, *mut c_int, *mut c_int, *mut *mut c_void) -> c_int;
+    type GetInstance = unsafe extern "C" fn() -> *mut c_void;
+    type Callback = unsafe extern "C" fn(i64, *mut c_void);
+    type Register = unsafe extern "C" fn(*mut c_void, Callback, *mut c_void);
+
+    unsafe extern "C" fn on_refresh_rate(period_nanos: i64, _data: *mut c_void) {
+        PERIOD_NANOS.store(period_nanos.max(0) as u64, Ordering::Relaxed);
+    }
+
+    /// The display's vsync period, tracked through the NDK choreographer (Android 11+).
+    pub fn period() -> Option<Duration> {
+        static STARTED: OnceLock<bool> = OnceLock::new();
+        if !*STARTED.get_or_init(start) {
+            return None;
+        }
+        match PERIOD_NANOS.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
+    }
+
+    fn start() -> bool {
+        let Ok(android) = Library::open(c"libandroid.so") else {
+            return false;
+        };
+        let functions = unsafe {
+            (
+                android.func::<Prepare>(c"ALooper_prepare"),
+                android.func::<PollOnce>(c"ALooper_pollOnce"),
+                android.func::<GetInstance>(c"AChoreographer_getInstance"),
+                android.func::<Register>(c"AChoreographer_registerRefreshRateCallback"),
+            )
+        };
+        let (Some(prepare), Some(poll_once), Some(instance), Some(register)) = functions else {
+            return false;
+        };
+        let watch = move || unsafe {
+            prepare(0);
+            let choreographer = instance();
+            if choreographer.is_null() {
+                return;
+            }
+            register(choreographer, on_refresh_rate, std::ptr::null_mut());
+            loop {
+                poll_once(-1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+            }
+        };
+        utils::spawn("vsync", watch).is_ok()
     }
 }

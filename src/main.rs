@@ -1,84 +1,77 @@
 use std::time::Duration;
 
-use android_egui::egui::{self, Align2, Color32, ComboBox, Slider, ViewportCommand, Window};
-use android_egui::{Backend, Capture, Draw, Overlay, Result, Touch};
+use android_egui::egui::{self, Align2, Color32, ComboBox, FontId, LayerId, Rect, Slider, Stroke, StrokeKind, ViewportCommand, Window, pos2};
+use android_egui::{ANativeWindowCreator, Capture, Graphics, GraphicsApi, Result, Touch};
 
 fn main() -> Result<()> {
-    let backend = std::env::args().nth(1).and_then(|name| Backend::parse(&name)).unwrap_or_default();
-    let mut overlay = Overlay::new("android-egui", backend)?;
-    let mut menu = Menu::new(&overlay);
+    let api = std::env::args().nth(1).and_then(|name| GraphicsApi::parse(&name)).unwrap_or_default();
+    let window = ANativeWindowCreator::create("android-egui")?;
+    let mut graphics = Graphics::create(&window, api)?;
+    let touch = Touch::init(&mut graphics)?;
 
-    while overlay.frame(|ui| menu.show(ui))? {
-        overlay.set_capture(menu.capture)?;
-        overlay.set_mirroring(menu.mirroring);
-        if menu.control != menu.touch.is_control() {
-            menu.control = menu.touch.set_control(menu.control).is_ok() && menu.control;
+    let title = format!("Android EGui · {}", graphics.name());
+    let (mut scale, mut capture, mut mirroring) = (1.0, Capture::Visible, false);
+    let (mut control, mut show_items, mut text) = (false, true, String::new());
+
+    while graphics.frame(|ui| {
+        if show_items {
+            items(ui);
+        }
+        let context = ui.ctx().clone();
+        Window::new(&title).default_pos([80.0, 80.0]).show(&context, |ui| {
+            let slider = ui.add(Slider::new(&mut scale, 0.5..=3.0).text("Scale"));
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                context.set_zoom_factor(scale);
+            }
+            ComboBox::from_label("Screenshots and recordings").selected_text(format!("{capture:?}")).show_ui(ui, |ui| {
+                for mode in [Capture::Visible, Capture::Hidden, Capture::Secure] {
+                    ui.selectable_value(&mut capture, mode, format!("{mode:?}"));
+                }
+            });
+            if capture == Capture::Visible {
+                ui.checkbox(&mut mirroring, "Mirror to screen recorders");
+            }
+            ui.checkbox(&mut show_items, "Draw items");
+            ui.checkbox(&mut control, "Control touches");
+            if control && ui.button("Swipe up").clicked() {
+                let display = window.display();
+                swipe(touch.clone(), [display.width as f32, display.height as f32]);
+            }
+            ui.text_edit_singleline(&mut text);
+            if ui.button("Close").clicked() {
+                context.send_viewport_cmd(ViewportCommand::Close);
+            }
+        });
+    })? {
+        window.set_capture(capture)?;
+        window.set_mirroring(mirroring);
+        if control != touch.is_control() {
+            control = touch.set_control(control).is_ok() && control;
         }
     }
     Ok(())
 }
 
-struct Menu {
-    title: String,
-    scale: f32,
-    capture: Capture,
-    mirroring: bool,
-    control: bool,
-    items: bool,
-    text: String,
-    touch: Touch,
-}
-
-impl Menu {
-    fn new(overlay: &Overlay) -> Self {
-        let title = format!("Android EGui · {}", overlay.backend());
-        Self { title, scale: 1.0, capture: Capture::Visible, mirroring: false, control: false, items: true, text: String::new(), touch: overlay.touch() }
-    }
-
-    fn show(&mut self, ui: &mut egui::Ui) {
-        if self.items {
-            items(ui);
-        }
-        let context = ui.ctx().clone();
-        Window::new(&self.title).default_pos([80.0, 80.0]).show(&context, |ui| {
-            let scale = ui.add(Slider::new(&mut self.scale, 0.5..=3.0).text("Scale"));
-            if scale.drag_stopped() || (scale.changed() && !scale.dragged()) {
-                context.set_zoom_factor(self.scale);
-            }
-            ComboBox::from_label("Screenshots and recordings").selected_text(format!("{:?}", self.capture)).show_ui(ui, |ui| {
-                for capture in [Capture::Visible, Capture::Hidden, Capture::Secure] {
-                    ui.selectable_value(&mut self.capture, capture, format!("{capture:?}"));
-                }
-            });
-            if self.capture == Capture::Visible {
-                ui.checkbox(&mut self.mirroring, "Mirror to screen recorders");
-            }
-            ui.checkbox(&mut self.items, "Draw items");
-            ui.checkbox(&mut self.control, "Control touches");
-            if self.control && ui.button("Swipe up").clicked() {
-                swipe(self.touch.clone(), Draw::new(ui).size());
-            }
-            ui.text_edit_singleline(&mut self.text);
-            if ui.button("Close").clicked() {
-                context.send_viewport_cmd(ViewportCommand::Close);
-            }
-        });
-    }
-}
-
-/// Things that are not part of the menu: boxes that follow positions of their own.
+/// Things that are not part of the menu: boxes that follow positions of their own. They are
+/// drawn behind the windows, on the background layer, which takes no touches. Positions are
+/// kept in pixels of the screen, as touches are; egui counts in points.
 fn items(ui: &egui::Ui) {
-    let draw = Draw::new(ui);
-    let [width, height] = draw.size();
+    let context = ui.ctx();
+    let painter = context.layer_painter(LayerId::background());
+    let pixel = 1.0 / context.pixels_per_point();
+    let point = |x: f32, y: f32| pos2(x * pixel, y * pixel);
+    let screen = context.viewport_rect().size() / pixel;
+    let (width, height) = (screen.x, screen.y);
     let time = ui.input(|input| input.time) as f32;
     for index in 0..5 {
         let turn = time * (0.3 + index as f32 * 0.07) + index as f32 * 1.3;
         let [x, y] = [width * (0.5 + 0.38 * turn.cos()), height * (0.5 + 0.3 * (turn * 1.4).sin())];
-        draw.line([width / 2.0, height], [x, y + 90.0], 2.0, Color32::from_white_alpha(90));
-        draw.rect([x - 45.0, y - 90.0], [x + 45.0, y + 90.0], 3.0, Color32::from_rgb(80, 220, 120));
-        draw.text([x, y - 98.0], Align2::CENTER_BOTTOM, format!("item {index}"), 30.0, Color32::WHITE);
+        painter.line_segment([point(width / 2.0, height), point(x, y + 90.0)], Stroke::new(2.0 * pixel, Color32::from_white_alpha(90)));
+        let outline = Stroke::new(3.0 * pixel, Color32::from_rgb(80, 220, 120));
+        painter.rect_stroke(Rect::from_min_max(point(x - 45.0, y - 90.0), point(x + 45.0, y + 90.0)), 0.0, outline, StrokeKind::Middle);
+        painter.text(point(x, y - 98.0), Align2::CENTER_BOTTOM, format!("item {index}"), FontId::proportional(30.0 * pixel), Color32::WHITE);
     }
-    ui.ctx().request_repaint();
+    context.request_repaint();
 }
 
 /// A finger of its own, dragged across the screen while the real ones stay free.

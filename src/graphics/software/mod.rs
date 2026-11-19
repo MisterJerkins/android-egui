@@ -1,3 +1,6 @@
+//! Drawing on the CPU: a rasterizer in safe Rust, and the backend that takes its picture to
+//! the window.
+
 mod raster;
 
 #[cfg(target_os = "android")]
@@ -12,13 +15,8 @@ mod backend {
 
     use super::raster::{Canvas, Damage, Texture, clip_region};
     use crate::Result;
-    use crate::graphics::{Frame, Graphics};
-    use crate::window::{NativeWindow, Region};
-
-    /// From this many pixels on, a redraw is shared between threads.
-    const WORTH_SHARING: i64 = 200_000;
-    const MOST_WORKERS: usize = 4;
-    const MOST_BUFFERS: usize = 8;
+    use crate::graphics::{Backend, Frame};
+    use crate::window::{ANativeWindow, Region};
 
     /// Draws on the CPU. The picture lives in memory of our own and only the tiles a frame
     /// changes are drawn again; each of the window's buffers is then brought up to date with
@@ -36,13 +34,13 @@ mod backend {
 
     impl Software {
         pub fn new() -> Self {
-            let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(MOST_WORKERS));
+            let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
             log::info!("software backend ready, up to {workers} threads");
             Self { textures: HashMap::new(), damage: Damage::default(), picture: Vec::new(), size: [0; 2], behind: Vec::new(), workers }
         }
     }
 
-    impl Graphics for Software {
+    impl Backend for Software {
         fn name(&self) -> &'static str {
             "software"
         }
@@ -51,7 +49,7 @@ mod backend {
             8192
         }
 
-        fn rebind(&mut self, _window: &NativeWindow) -> Result<()> {
+        fn rebind(&mut self, _window: &ANativeWindow) -> Result<()> {
             self.damage.reset();
             self.behind.clear();
             Ok(())
@@ -94,7 +92,8 @@ mod backend {
                     }
                 };
                 let canvas = Canvas::new(&mut self.picture, width, damage);
-                if damage.area() < WORTH_SHARING || self.workers < 2 {
+                // From 200 thousand pixels on, a redraw is shared between threads.
+                if damage.area() < 200_000 || self.workers < 2 {
                     draw(canvas);
                 } else {
                     std::thread::scope(|scope| canvas.bands(self.workers).into_iter().for_each(|band| drop(scope.spawn(|| draw(band)))));
@@ -109,7 +108,7 @@ mod backend {
     }
 
     impl Software {
-        fn present(&mut self, window: &NativeWindow, screen: Region, damage: Region) -> Result<()> {
+        fn present(&mut self, window: &ANativeWindow, screen: Region, damage: Region) -> Result<()> {
             let mut buffer = window.lock(None)?;
             let bounds = Region { left: 0, top: 0, right: buffer.width() as i32, bottom: buffer.height() as i32 };
             let (pixels, stride) = buffer.pixels();
@@ -126,7 +125,8 @@ mod backend {
             match known {
                 Some(index) => self.behind[index].1 = Region::default(),
                 None => {
-                    if self.behind.len() == MOST_BUFFERS {
+                    // A window has fewer than eight buffers: a list that long holds addresses of buffers that are gone.
+                    if self.behind.len() == 8 {
                         self.behind.clear();
                     }
                     self.behind.push((address, Region::default()));

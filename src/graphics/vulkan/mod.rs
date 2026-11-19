@@ -10,14 +10,11 @@ use ash::{Device, Entry, Instance, khr, vk};
 use egui::epaint::{ImageDelta, Primitive, Vertex};
 use egui::{ImageData, TextureFilter, TextureId, TextureOptions, TextureWrapMode};
 
-use super::{Frame, Graphics};
-use crate::window::NativeWindow;
+use super::{Backend, Frame};
+use crate::window::ANativeWindow;
 use crate::{Result, bail, err};
 
-const VERTEX_SHADER: &[u8] = include_bytes!("shaders/ui.vert.spv");
-const FRAGMENT_SHADER: &[u8] = include_bytes!("shaders/ui.frag.spv");
 const MOST_TEXTURES: u32 = 1024;
-const SMALLEST_BUFFER: u64 = 1 << 16;
 
 fn check<T>(what: &str, result: VkResult<T>) -> Result<T> {
     result.map_err(|code| err!("{what} failed: {code}"))
@@ -120,7 +117,7 @@ pub struct Vulkan {
 }
 
 impl Vulkan {
-    pub fn new(window: &NativeWindow) -> Result<Self> {
+    pub fn new(window: &ANativeWindow) -> Result<Self> {
         unsafe {
             let base = Base::new(window.as_ptr())?;
             let devices = check("vkEnumeratePhysicalDevices", base.instance.enumerate_physical_devices())?;
@@ -236,8 +233,8 @@ impl Vulkan {
                 let words = ash::util::read_spv(&mut Cursor::new(code)).map_err(|error| err!("bad shader: {error}"))?;
                 check("vkCreateShaderModule", device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None))
             };
-            let vertex = module(VERTEX_SHADER)?;
-            let fragment = module(FRAGMENT_SHADER).inspect_err(|_| device.destroy_shader_module(vertex, None))?;
+            let vertex = module(include_bytes!("shaders/ui.vert.spv"))?;
+            let fragment = module(include_bytes!("shaders/ui.frag.spv")).inspect_err(|_| device.destroy_shader_module(vertex, None))?;
             let stages = [
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(vertex).name(c"main"),
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(fragment).name(c"main"),
@@ -351,7 +348,8 @@ impl Vulkan {
     unsafe fn create_buffer(&self, usage: vk::BufferUsageFlags, size: u64) -> Result<Buffer> {
         unsafe {
             let mut made = Buffer::empty(usage);
-            made.capacity = size.next_power_of_two().max(SMALLEST_BUFFER);
+            // No buffer is made smaller than 64 KB.
+            made.capacity = size.next_power_of_two().max(1 << 16);
             let info = vk::BufferCreateInfo::default().size(made.capacity).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
             made.buffer = check("vkCreateBuffer", self.device.create_buffer(&info, None))?;
             let visible = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -582,7 +580,7 @@ impl Buffer {
     }
 }
 
-impl Graphics for Vulkan {
+impl Backend for Vulkan {
     fn name(&self) -> &'static str {
         "Vulkan"
     }
@@ -591,7 +589,7 @@ impl Graphics for Vulkan {
         self.max_texture_side
     }
 
-    fn rebind(&mut self, window: &NativeWindow) -> Result<()> {
+    fn rebind(&mut self, window: &ANativeWindow) -> Result<()> {
         unsafe {
             check("vkDeviceWaitIdle", self.device.device_wait_idle())?;
             if window.as_ptr() != self.base.window {

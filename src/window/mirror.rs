@@ -4,6 +4,8 @@
 //! misses a layer made beside them. Each such display has a layer stack of its own; a mirror of
 //! the overlay is put on every one of them, scaled the way the system scales the screen there.
 
+use crate::utils;
+
 /// A display as `dumpsys display` lists it: its layer stack and the size of the space it shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shown {
@@ -16,10 +18,9 @@ pub fn displays(dump: &str) -> Vec<Shown> {
     let mut shown = Vec::new();
     for device in dump.split("DisplayDeviceInfo{").skip(1) {
         let field = |name: &str| device.lines().find_map(|line| line.trim().strip_prefix(name));
-        let stack = field("mCurrentLayerStack=").and_then(|stack| stack.trim().parse::<u32>().ok());
+        let stack = field("mCurrentLayerStack=").and_then(utils::parse::<u32>);
         let size = field("mCurrentLayerStackRect=Rect(").and_then(|rect| {
-            let numbers: Vec<f32> =
-                rect.split(|c: char| !c.is_ascii_digit() && c != '-').filter(|part| !part.is_empty() && *part != "-").filter_map(|part| part.parse().ok()).collect();
+            let numbers: Vec<f32> = rect.split(|c: char| !c.is_ascii_digit() && c != '-').filter(|part| !part.is_empty() && *part != "-").filter_map(utils::parse).collect();
             let [left, top, right, bottom] = numbers[..] else { return None };
             Some([right - left, bottom - top]).filter(|size| size[0] > 0.0 && size[1] > 0.0)
         });
@@ -42,15 +43,14 @@ mod worker {
     use std::collections::HashMap;
     use std::collections::hash_map::Entry;
     use std::process::Command;
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
     use super::super::libgui::{Handle, LibGui};
     use super::{displays, fit};
+    use crate::utils;
 
-    const FIRST_API: u32 = 34;
-    const POLL: Duration = Duration::from_secs(1);
     const MAIN_STACK: u32 = 0;
 
     #[derive(Clone)]
@@ -74,7 +74,7 @@ mod worker {
 
     impl Shared {
         fn lock(&self) -> MutexGuard<'_, State> {
-            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+            utils::lock(&self.state)
         }
     }
 
@@ -96,12 +96,13 @@ mod worker {
     impl Mirrors {
         /// Returns `None` where recordings see the overlay without help, or mirroring is missing.
         pub fn start(gui: &'static LibGui, client: Handle) -> Option<Self> {
-            if gui.api() < FIRST_API || !gui.can_mirror() {
+            // Recordings miss the overlay from Android 14 (API 34) on.
+            if gui.api() < 34 || !gui.can_mirror() {
                 return None;
             }
             let shared = Arc::new(Shared::default());
             let seen = shared.clone();
-            let worker = std::thread::Builder::new().name("mirror".into()).spawn(move || work(gui, &client, &seen)).ok()?;
+            let worker = utils::spawn("mirror", move || work(gui, &client, &seen)).ok()?;
             Some(Self { shared, worker: Some(worker), version: 0 })
         }
 
@@ -172,7 +173,7 @@ mod worker {
 
             // The next look is a second away, or as soon as the layer to mirror changes.
             let same = |state: &mut State| !state.stop && state.source.as_ref().is_some_and(|source| source.version == version);
-            drop(shared.wake.wait_timeout_while(shared.lock(), POLL, same));
+            drop(shared.wake.wait_timeout_while(shared.lock(), Duration::from_secs(1), same));
         }
     }
 }
@@ -181,7 +182,9 @@ mod worker {
 mod tests {
     use super::*;
 
-    const DUMP: &str = r#"
+    #[test]
+    fn displays_are_read_from_the_dump() {
+        let dump = r#"
 Display Devices: size=3
   DisplayDeviceInfo{"Built-in Screen": uniqueId="local:4630946218744042899", 1504 x 2400, modeId 1, supportedModes [{id=1, width=1504, height=2400, fps=60.0}], state ON}
     mAdapter=LocalDisplayAdapter
@@ -203,10 +206,7 @@ Display Devices: size=3
     mCurrentLayerStackRect=Rect(0, 0 - 800, 600)
 Logical Displays: size=1
 "#;
-
-    #[test]
-    fn displays_are_read_from_the_dump() {
-        assert_eq!(displays(DUMP), [Shown { stack: 0, size: [2400.0, 1504.0] }, Shown { stack: 7, size: [1280.0, 720.0] }]);
+        assert_eq!(displays(dump), [Shown { stack: 0, size: [2400.0, 1504.0] }, Shown { stack: 7, size: [1280.0, 720.0] }]);
         assert!(displays("nothing of the kind").is_empty());
     }
 

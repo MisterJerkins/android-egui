@@ -9,12 +9,14 @@ rust + egui, three render backends (OpenGL ES, Vulkan, CPU) and one binary for a
 ![demo](docs/demo.png)
 
 ```rust
-use android_egui::{Backend, Overlay, Result, egui};
+use android_egui::{ANativeWindowCreator, Graphics, GraphicsApi, Result, Touch, egui};
 
 fn main() -> Result<()> {
-    let mut overlay = Overlay::new("my-overlay", Backend::Auto)?;
+    let window = ANativeWindowCreator::create("my-overlay")?;
+    let mut graphics = Graphics::create(&window, GraphicsApi::Auto)?;
+    let _touch = Touch::init(&mut graphics)?;
     let mut name = String::new();
-    while overlay.frame(|ui| {
+    while graphics.frame(|ui| {
         egui::Window::new("Menu").show(ui.ctx(), |ui| {
             ui.text_edit_singleline(&mut name);
         });
@@ -23,8 +25,9 @@ fn main() -> Result<()> {
 }
 ```
 
-thats the whole thing. the full demo (menu, scale slider, capture modes, touch control, moving
-"items") is [src/main.rs](src/main.rs), ~80 lines.
+thats the whole thing: a window over the screen, graphics that draw into it, touches. the full
+demo (menu, scale slider, capture modes, touch control, moving "items") is
+[src/main.rs](src/main.rs), ~80 lines.
 
 ## Quick start
 
@@ -47,14 +50,14 @@ first arg picks the backend: `auto` (default), `gl`, `vk`, `cpu`.
 | | |
 |---|---|
 | layer | android 5-17. every `libgui.so` call is picked by which symbol actually exists, not by version number, so a weird rom gives you an `Err` instead of a segfault. rotation is followed live |
-| backends | OpenGL ES 3/2, Vulkan 1.0+, and a CPU rasterizer in safe rust. `Backend::Auto` tries them in that order |
+| backends | OpenGL ES 3/2, Vulkan 1.0+, and a CPU rasterizer in safe rust. `GraphicsApi::Auto` tries them in that order |
 | touches | read only by default - the app under the overlay keeps getting its touches like nothing happened |
-| control mode | `overlay.touch().set_control(true)`: touches on the menu stop reaching the app, and you get `down / move_to / up / tap / swipe` from code - your own fingers in their own slots, alongside the real ones |
+| control mode | `touch.set_control(true)`: touches on the menu stop reaching the app, and you get `down / move_to / up / tap / swipe` from code - your own fingers in their own slots, alongside the real ones |
 | keyboard | own on-screen EN/RU keyboard (letters, two symbol pages, an edit page with select all / cut / copy / paste / undo / arrows) + hardware keyboards with Ctrl+A/C/X/V/Z, autorepeat, layout switch |
 | clipboard | the real system one: copy in the overlay, paste in any app, and back |
 | capture | `Capture::Visible / Hidden / Secure` - keep the overlay out of screenshots and recordings |
-| mirroring | on android 14+ recorders only see window manager layers, so they miss the overlay. `overlay.set_mirroring(true)` copies it onto the recording display. off by default, and does nothing while the overlay is hidden |
-| draw | `Draw::new(ui)` - lines, boxes, circles, text and pictures in raw screen pixels, under the windows, never takes touches |
+| mirroring | on android 14+ recorders only see window manager layers, so they miss the overlay. `window.set_mirroring(true)` copies it onto the recording display. off by default, and does nothing while the overlay is hidden |
+| draw | plain egui: a painter on the background layer draws lines, boxes, circles, text and pictures under the windows and never takes touches |
 | pictures | PNG / JPEG from memory or a file, or raw RGBA. works the same on all three backends |
 | no evdev | containers without touch devices: touches come from the system input monitor (android 10+) |
 
@@ -134,45 +137,61 @@ tablet, Snapdragon 8 Elite (8 cores), 2400×1504 @ 60 Hz, android 15, release bu
 
 ## API
 
+three steps, three values you own:
+
 ```rust
-let mut overlay = Overlay::new(name, backend)?;   // layer, graphics, input threads
-overlay.frame(|ui| { ... })?;                     // one frame; sleeps until there is something to draw
-overlay.context();                                // egui::Context: style, fonts, zoom
-overlay.display();                                // size, rotation, density
-overlay.set_capture(Capture::Hidden)?;            // hide from screenshots and recordings
-overlay.set_mirroring(true);                      // or show up in android 14+ recorders (off by default)
-overlay.keyboard().set_language(Language::Russian);
-overlay.keyboard().set_clipboard("text");         // same as Ctrl+C in the ui
-let touch = overlay.touch();                      // Clone + Send, take it to your own thread
-touch.set_control(true)?;
+let window = ANativeWindowCreator::create(name)?;                   // the layer over the screen
+let mut graphics = Graphics::create(&window, GraphicsApi::Auto)?;   // the backend, the egui context, the frames
+let touch = Touch::init(&mut graphics)?;                            // input threads, keyboards, clipboard
+
+graphics.frame(|ui| { ... })?;                    // one frame; sleeps until there is something to draw
+graphics.context();                               // egui::Context: style, fonts, zoom
+graphics.name();                                  // the backend in use
+window.display();                                 // size, rotation, density
+window.set_capture(Capture::Hidden)?;             // hide from screenshots and recordings
+window.set_mirroring(true);                       // or show up in android 14+ recorders (off by default)
+touch.keyboard().set_language(Language::Russian);
+touch.keyboard().set_clipboard("text");           // same as Ctrl+C in the ui
+touch.set_control(true)?;                         // `touch` is Clone + Send, take it to your own thread
 touch.swipe([900.0, 1200.0], [900.0, 400.0], Duration::from_millis(300))?;
 ```
 
-`frame` returns `false` after `ViewportCommand::Close` or `overlay.close()`. nothing is drawn
+`GraphicsApi` is `Auto`, `OpenGl`, `Vulkan` or `Software`. `window` is cheap to clone, every clone
+is the same window. `Touch::init` can be left out: frames still run, they just get no input and
+are drawn only when the ui asks for a repaint. `touch.keyboard()` is shared with the frames, so
+dont keep what it returns across a frame.
+
+`frame` returns `false` after `ViewportCommand::Close` or `graphics.close()`. nothing is drawn
 while nothing changes. for things that move on their own call `ui.ctx().request_repaint()`.
 
-`Touch` and `Draw` work in screen pixels in the current orientation, egui itself works in points.
+`Touch` works in screen pixels in the current orientation, egui itself works in points: one
+pixel is `1.0 / ctx.pixels_per_point()` points.
 
-drawing things that are not a menu (boxes, lines, labels at positions you update every frame):
+drawing things that are not a menu (boxes, lines, labels at positions you update every frame) is
+plain egui - a painter on the background layer, which sits under the windows and takes no touches:
 
 ```rust
-let draw = Draw::new(ui);
-draw.line([x, y], [x2, y2], 2.0, Color32::WHITE);
-draw.rect([x - 45.0, y - 90.0], [x + 45.0, y + 90.0], 3.0, Color32::GREEN);
-draw.text([x, y - 98.0], Align2::CENTER_BOTTOM, "item", 30.0, Color32::WHITE);
+let painter = ui.ctx().layer_painter(LayerId::background());
+let pixel = 1.0 / ui.ctx().pixels_per_point();   // one screen pixel in egui points
+let point = |x: f32, y: f32| pos2(x * pixel, y * pixel);
+let frame = Rect::from_min_max(point(x - 45.0, y - 90.0), point(x + 45.0, y + 90.0));
+painter.line_segment([point(x, y), point(x2, y2)], Stroke::new(2.0 * pixel, Color32::WHITE));
+painter.rect_stroke(frame, 0.0, Stroke::new(3.0 * pixel, Color32::GREEN), StrokeKind::Middle);
+painter.text(point(x, y - 98.0), Align2::CENTER_BOTTOM, "item", FontId::proportional(30.0 * pixel), Color32::WHITE);
 ```
 
 pictures - load once before the loop, draw as much as you want:
 
 ```rust
-let icon = overlay.load_image("icon", include_bytes!("icon.png"))?;   // PNG or JPEG from memory
-let photo = overlay.load_image_file("/sdcard/Pictures/photo.jpg")?;   // or from a file
-let mask = overlay.load_pixels("mask", [2, 2], &[255; 16])?;          // or raw RGBA
+let icon = graphics.load_image("icon", include_bytes!("icon.png"))?;   // PNG or JPEG from memory
+let photo = graphics.load_image_file("/sdcard/Pictures/photo.jpg")?;   // or from a file
+let mask = graphics.load_pixels("mask", [2, 2], &[255; 16])?;          // or raw RGBA
 
-while overlay.frame(|ui| {
+while graphics.frame(|ui| {
     egui::Window::new("Menu").show(ui.ctx(), |ui| ui.image(&icon));   // inside a window
-    let [w, h] = icon.size().map(|side| side as f32);
-    Draw::new(ui).image(&icon, [100.0, 100.0], [100.0 + w, 100.0 + h]);   // anywhere on screen
+    let place = Rect::from_min_size(pos2(40.0, 40.0), icon.size_vec2());
+    let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    ui.ctx().layer_painter(LayerId::background()).image(icon.id(), place, whole, Color32::WHITE);   // anywhere on screen
 })? {}
 ```
 
@@ -230,22 +249,24 @@ cargo test --lib --target x86_64-unknown-linux-gnu
 ```
 src/
     main.rs         the demo
-    lib.rs          crate root: exports, error type
-    overlay/        Overlay - the frame loop: input -> egui -> graphics
-    draw/           Draw - drawing in screen pixels, picture loading
-    window/         libgui (C++ ABI), ANativeWindow, the layer, mirrors for recorders
-    graphics/       opengl/  vulkan/  software/
+    lib.rs          crate root: exports
+    utils/          error type, shared helpers, dlopen, properties, inotify, ioctl, the logger
+    window/         ANativeWindowCreator, NativeWindow: libgui (C++ ABI), the layer, mirrors for recorders
+    graphics/       Graphics - the frame loop: input -> egui -> backend; picture loading
+        opengl/     OpenGL ES backend, EGL
+        vulkan/     Vulkan backend, shaders
+        software/   CPU backend, rasterizer
     input/          evdev reading, device classification, routing
-        touch/      protocol parsers, coordinate transforms, control mode
+        touch/      Touch, protocol parsers, coordinate transforms, control mode
         keyboard/   hardware + on-screen keyboards, clipboard
     helper/         the java helper and how its started
-    sys/            dlopen, properties, logging, evdev, uinput, inotify, choreographer
 dependencies/       vendored crates
 tools/              build scripts
 ```
 
-`unsafe` only lives where it has to: `sys`, `window::libgui`, `window::native`,
-`graphics::opengl::egl`, `graphics::vulkan`. the rest of the crate is `#![deny(unsafe_code)]`.
+`unsafe` only lives where it has to: `utils::ffi`, `utils::logger::logcat`, `window::libgui`,
+`window::native`, `graphics::vsync`, `graphics::opengl::egl`, `graphics::vulkan`. the rest of the
+crate is `#![deny(unsafe_code)]`.
 
 ## Good to know
 
@@ -261,7 +282,7 @@ tools/              build scripts
   `dumpsys` run each time). with it on, the first second of a recording can still be without the
   overlay, until the mirror picks up the new recording display
 - fonts are egui's built-in ones. need CJK or anything else - add your own through
-  `overlay.context()`
+  `graphics.context()`
 
 ## Credits
 

@@ -3,8 +3,8 @@ mod egl;
 
 use egui_glow::Painter;
 
-use super::{Frame, Graphics};
-use crate::window::NativeWindow;
+use super::{Backend, Frame};
+use crate::window::ANativeWindow;
 use crate::{Result, err};
 
 pub struct OpenGl {
@@ -13,7 +13,7 @@ pub struct OpenGl {
 }
 
 impl OpenGl {
-    pub fn new(window: &NativeWindow) -> Result<Self> {
+    pub fn new(window: &ANativeWindow) -> Result<Self> {
         let egl = egl::Context::new(window.as_ptr())?;
         let painter = Painter::new(egl.gl().clone(), "", None, false).map_err(|error| err!("OpenGL painter failed to start: {error}"))?;
         log::info!("OpenGL ES {} backend ready", egl.version());
@@ -21,7 +21,7 @@ impl OpenGl {
     }
 }
 
-impl Graphics for OpenGl {
+impl Backend for OpenGl {
     fn name(&self) -> &'static str {
         "OpenGL ES"
     }
@@ -30,7 +30,7 @@ impl Graphics for OpenGl {
         self.painter.max_texture_side()
     }
 
-    fn rebind(&mut self, window: &NativeWindow) -> Result<()> {
+    fn rebind(&mut self, window: &ANativeWindow) -> Result<()> {
         self.egl.rebind(window.as_ptr())
     }
 

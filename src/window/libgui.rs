@@ -4,21 +4,17 @@ use std::mem::MaybeUninit;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 
-use super::{Capture, NativeWindow};
-use crate::sys::dl::Library;
-use crate::sys::prop;
+use super::{ANativeWindow, Capture, FORMAT_RGBA_8888};
+use crate::utils::{self, Library};
 use crate::{Result, bail, err};
 
 pub type Ptr = *mut c_void;
 
-const FORMAT_RGBA_8888: i32 = 1;
 const FLAG_SKIP_SCREENSHOT: u32 = 0x40;
 const FLAG_SECURE: u32 = 0x80;
 const FLAG_CONTAINER: u32 = 0x4000;
 const WINDOW_TYPE_DONT_SCREENSHOT: i32 = 441_731;
 const METADATA_WINDOW_TYPE: u32 = 2;
-/// Android 8.0 already takes the window type that hides a layer, and does nothing with it.
-const FIRST_API_HIDING_LAYERS: u32 = 27;
 const TRUSTED_OVERLAY_ENABLED: i32 = 2;
 const OBJECT_SIZE: usize = 4096;
 const GUARD: [u8; 32] = [0xA5; 32];
@@ -277,7 +273,7 @@ impl LibGui {
     }
 
     unsafe fn load() -> Result<Self> {
-        let api = prop::api_level();
+        let api = utils::api_level();
         let utils = Library::open(c"libutils.so")?;
         let gui = Library::open(c"libgui.so")?;
         let mut utils = Resolver { library: &utils, picks: Vec::new() };
@@ -566,7 +562,8 @@ impl LibGui {
             if hidden && by_flag {
                 flags |= FLAG_SKIP_SCREENSHOT;
             }
-            if hidden && self.api < FIRST_API_HIDING_LAYERS {
+            // Android 8.0 (API 26) already takes the window type that hides a layer, and does nothing with it.
+            if hidden && self.api < 27 {
                 log::warn!("a layer cannot be kept out of captures before Android 8.1");
             }
 
@@ -632,12 +629,12 @@ impl LibGui {
         }
     }
 
-    pub fn window(&self, control: Ptr) -> Result<(Ptr, NativeWindow)> {
+    pub fn window(&self, control: Ptr) -> Result<(Ptr, ANativeWindow)> {
         let surface = unsafe { (self.surface)(control) }.value;
         if surface.is_null() {
             bail!("SurfaceControl::getSurface returned null");
         }
-        match unsafe { NativeWindow::from_surface(surface) } {
+        match unsafe { ANativeWindow::from_surface(surface) } {
             Ok(window) => Ok((surface, window)),
             Err(error) => {
                 self.release(surface);

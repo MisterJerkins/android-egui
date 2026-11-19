@@ -1,12 +1,12 @@
-use std::path::Path;
+//! Pictures: decoding them and handing their pixels to the graphics backend as textures.
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
 use crate::{Result, bail, err};
 
-/// A picture loaded for drawing: `ui.image(&texture)` puts it into a window, [`crate::Draw::image`]
-/// anywhere on the screen, and `texture.size()` is its size in pixels. The graphics backend
-/// keeps it until the last copy of the handle is dropped.
+/// A picture loaded for drawing. `ui.image(&texture)` puts it into a window, a painter draws it
+/// anywhere with `painter.image(texture.id(), ..)`, and `texture.size()` is its size in pixels.
+/// The graphics backend keeps it until the last copy of the handle is dropped.
 pub type Texture = TextureHandle;
 
 /// Hands RGBA pixels, four bytes each, row after row from the top, to the graphics backend.
@@ -28,14 +28,12 @@ pub fn decode(name: &str, data: &[u8]) -> Result<([usize; 2], Vec<u8>)> {
     Ok(([picture.width() as usize, picture.height() as usize], picture.into_raw()))
 }
 
-pub fn read(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|error| err!("cannot read {}: {error}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
+    use egui::epaint::Shape;
+    use egui::{Color32, LayerId, RawInput, Rect, pos2, vec2};
     use image::{ImageFormat, Rgba, RgbaImage};
 
     use super::*;
@@ -83,5 +81,27 @@ mod tests {
         assert!(load(&context, "short", [3, 2], &[255; 20], 2048).is_err());
         assert!(load(&context, "empty", [0, 2], &[], 2048).is_err());
         assert!(load(&context, "huge", [3, 2], &[255; 24], 2).is_err());
+    }
+
+    #[test]
+    fn a_texture_is_drawn_by_a_painter_and_by_a_widget() {
+        let context = Context::default();
+        let picture = load(&context, "test", [2, 2], &[255; 16], 2048).unwrap();
+        let place = Rect::from_min_max(pos2(10.0, 20.0), pos2(30.0, 40.0));
+        let input = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0))), ..Default::default() };
+        let mut output = context.run_ui(input, |ui| {
+            let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            ui.ctx().layer_painter(LayerId::background()).image(picture.id(), place, whole, Color32::WHITE);
+            ui.image(&picture);
+        });
+        output.textures_delta.clear();
+
+        let shows = |shape: &Shape, at: Option<Rect>| match shape {
+            Shape::Rect(rect) => at.is_none_or(|at| rect.rect == at) && rect.brush.as_ref().is_some_and(|brush| brush.fill_texture_id == picture.id()),
+            Shape::Mesh(mesh) => at.is_none_or(|at| mesh.calc_bounds() == at) && mesh.texture_id == picture.id(),
+            _ => false,
+        };
+        assert!(output.shapes.iter().any(|clipped| shows(&clipped.shape, Some(place))), "the painter's picture is not where it was put");
+        assert!(output.shapes.iter().filter(|clipped| shows(&clipped.shape, None)).count() >= 2, "the widget drew no picture");
     }
 }

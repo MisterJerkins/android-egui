@@ -1,7 +1,10 @@
+//! Touch panels: the three ways they report fingers, each turned into contacts, and the way
+//! from a place on a panel to a place on the screen and back.
+
 use std::time::Duration;
 
-use crate::input::classify::{Panel, Protocol};
-use crate::input::evdev::*;
+use crate::input::device::*;
+use crate::window::Rotation;
 
 const MAX_CONTACTS: usize = 32;
 
@@ -51,6 +54,11 @@ struct Slot {
 }
 
 const EMPTY_SLOT: Slot = Slot { tracking: -1, x: 0, y: 0, pressure: 0, palm: false, live: None, moved: false };
+
+/// What a slot holds on an axis: zero where the device does not have the axis.
+fn held(values: &[i32], slot: usize) -> i32 {
+    values.get(slot).copied().unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Default)]
 struct Point {
@@ -152,27 +160,15 @@ impl TouchParser {
     /// it. A slot that merely holds a tracking id does not: some drivers leave zero in slots
     /// that were never used.
     pub fn touching(&self, state: &AxisState, pressed: bool) -> bool {
-        let column = |code: u16| state.values.iter().find(|(other, _)| *other == code).map(|(_, values)| values.as_slice()).unwrap_or_default();
-        let (tracking, pressure, tool) = (column(ABS_MT_TRACKING_ID), column(ABS_MT_PRESSURE), column(ABS_MT_TOOL_TYPE));
-        let value = |values: &[i32], slot: usize| values.get(slot).copied().unwrap_or(0);
-        (0..tracking.len()).any(|slot| tracking[slot] >= 0 && !self.hovers(pressed, value(pressure, slot), value(tool, slot) == MT_TOOL_PALM))
+        let (tracking, pressure, tool) = (state.column(ABS_MT_TRACKING_ID), state.column(ABS_MT_PRESSURE), state.column(ABS_MT_TOOL_TYPE));
+        (0..tracking.len()).any(|slot| tracking[slot] >= 0 && !self.hovers(pressed, held(pressure, slot), held(tool, slot) == MT_TOOL_PALM))
     }
 
     /// Loads the slot state read straight from the device, and whether its touch button is down.
     pub fn restore_slots(&mut self, state: &AxisState, pressed: bool, out: &mut Vec<Contact>) {
-        let column = |code: u16| state.values.iter().find(|(other, _)| *other == code).map(|(_, values)| values.as_slice()).unwrap_or_default();
-        let (tracking, x, y, pressure, tool) =
-            (column(ABS_MT_TRACKING_ID), column(ABS_MT_POSITION_X), column(ABS_MT_POSITION_Y), column(ABS_MT_PRESSURE), column(ABS_MT_TOOL_TYPE));
-        let value = |values: &[i32], slot: usize| values.get(slot).copied().unwrap_or(0);
+        let [tracking, x, y, pressure, tool] = [ABS_MT_TRACKING_ID, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_PRESSURE, ABS_MT_TOOL_TYPE].map(|code| state.column(code));
         self.slots = (0..tracking.len().min(MAX_CONTACTS))
-            .map(|slot| Slot {
-                tracking: tracking[slot],
-                x: value(x, slot),
-                y: value(y, slot),
-                pressure: value(pressure, slot),
-                palm: value(tool, slot) == MT_TOOL_PALM,
-                ..EMPTY_SLOT
-            })
+            .map(|slot| Slot { tracking: tracking[slot], x: held(x, slot), y: held(y, slot), pressure: held(pressure, slot), palm: held(tool, slot) == MT_TOOL_PALM, ..EMPTY_SLOT })
             .collect();
         self.current = usize::try_from(state.slot).unwrap_or(0).min(MAX_CONTACTS - 1);
         self.pressed = pressed;
@@ -395,11 +391,42 @@ impl TouchParser {
     }
 }
 
+/// Turns a position given as fractions of an unrotated surface into fractions of the same
+/// surface after `rotation`, matching Android's input reader.
+pub fn rotate(u: f32, v: f32, rotation: Rotation) -> (f32, f32) {
+    match rotation {
+        Rotation::Deg0 => (u, v),
+        Rotation::Deg90 => (v, 1.0 - u),
+        Rotation::Deg180 => (1.0 - u, 1.0 - v),
+        Rotation::Deg270 => (1.0 - v, u),
+    }
+}
+
+/// Maps a touch panel position to pixels of the display in its current orientation.
+pub fn touch_to_screen(u: f32, v: f32, panel: &Panel, size: [f32; 2], rotation: Rotation) -> [f32; 2] {
+    let (u, v) = rotate(u, v, panel.orientation);
+    let (u, v) = if panel.follows_display { rotate(u, v, rotation) } else { (u, v) };
+    [u * size[0], v * size[1]]
+}
+
+/// The reverse of [`touch_to_screen`] for a panel that lies the way the display naturally does.
+pub fn screen_to_touch(position: [f32; 2], size: [f32; 2], rotation: Rotation) -> (f32, f32) {
+    let back = match rotation {
+        Rotation::Deg90 => Rotation::Deg270,
+        Rotation::Deg270 => Rotation::Deg90,
+        straight => straight,
+    };
+    rotate(position[0] / size[0], position[1] / size[1], back)
+}
+
+/// Absolute pointers (emulator mice) already report in the display's current orientation.
+pub fn pointer_to_screen(u: f32, v: f32, size: [f32; 2]) -> [f32; 2] {
+    [u * size[0], v * size[1]]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::classify::Confidence;
-    use crate::window::Rotation;
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
@@ -672,5 +699,57 @@ mod tests {
         assert!((down[0].u - 0.5).abs() < 1e-3 && (down[0].v - 0.25).abs() < 1e-3);
         assert_eq!(phases(&feed(&mut parser, MS(5), &[(EV_ABS, ABS_X, 3000), SYN])), [(1, Phase::Move)]);
         assert_eq!(phases(&feed(&mut parser, MS(9), &[(EV_KEY, BTN_TOUCH, 0), SYN])), [(1, Phase::End)]);
+    }
+
+    /// The tablet's panel, lying in the device the given way.
+    fn placed(orientation: Rotation, follows_display: bool) -> Panel {
+        Panel { orientation, follows_display, ..panel(Protocol::Slots, 15039, 23999) }
+    }
+
+    fn close(actual: [f32; 2], expected: [f32; 2]) {
+        assert!((actual[0] - expected[0]).abs() < 0.01 && (actual[1] - expected[1]).abs() < 0.01, "{actual:?} != {expected:?}");
+    }
+
+    #[test]
+    fn follows_every_display_rotation() {
+        let touch = placed(Rotation::Deg0, true);
+        let (u, v) = (0.25, 0.1);
+        close(touch_to_screen(u, v, &touch, [1504.0, 2400.0], Rotation::Deg0), [376.0, 240.0]);
+        close(touch_to_screen(u, v, &touch, [2400.0, 1504.0], Rotation::Deg90), [240.0, 1128.0]);
+        close(touch_to_screen(u, v, &touch, [1504.0, 2400.0], Rotation::Deg180), [1128.0, 2160.0]);
+        close(touch_to_screen(u, v, &touch, [2400.0, 1504.0], Rotation::Deg270), [2160.0, 376.0]);
+    }
+
+    #[test]
+    fn screen_positions_map_back_to_the_panel() {
+        let touch = placed(Rotation::Deg0, true);
+        for (rotation, size) in
+            [(Rotation::Deg0, [1504.0, 2400.0]), (Rotation::Deg90, [2400.0, 1504.0]), (Rotation::Deg180, [1504.0, 2400.0]), (Rotation::Deg270, [2400.0, 1504.0])]
+        {
+            let (u, v) = screen_to_touch(touch_to_screen(0.25, 0.1, &touch, size, rotation), size, rotation);
+            assert!((u - 0.25).abs() < 1e-5 && (v - 0.1).abs() < 1e-5, "{rotation:?}: {u} {v}");
+        }
+    }
+
+    #[test]
+    fn four_quarter_turns_are_the_identity() {
+        let (mut u, mut v) = (0.3, 0.8);
+        for _ in 0..4 {
+            (u, v) = rotate(u, v, Rotation::Deg90);
+        }
+        assert!((u - 0.3).abs() < 1e-6 && (v - 0.8).abs() < 1e-6);
+        let (a, b) = rotate(0.3, 0.8, Rotation::Deg90);
+        let (a, b) = rotate(a, b, Rotation::Deg270);
+        assert!((a - 0.3).abs() < 1e-6 && (b - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panel_orientation_and_fixed_panels() {
+        let turned = placed(Rotation::Deg90, true);
+        close(touch_to_screen(0.25, 0.1, &turned, [1000.0, 500.0], Rotation::Deg0), [100.0, 375.0]);
+
+        let fixed = placed(Rotation::Deg0, false);
+        close(touch_to_screen(0.25, 0.1, &fixed, [1000.0, 500.0], Rotation::Deg270), [250.0, 50.0]);
+        close(pointer_to_screen(0.5, 0.5, [2560.0, 1440.0]), [1280.0, 720.0]);
     }
 }

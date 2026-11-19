@@ -14,25 +14,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use crate::input::{Clipboard, Motion};
-use crate::{Result, err};
+use crate::{Result, err, utils};
 
 /// Empty in a build without the `helper` feature, which then never starts one.
 #[cfg(feature = "helper")]
 const DEX: &[u8] = include_bytes!("helper.dex");
 #[cfg(not(feature = "helper"))]
 const DEX: &[u8] = &[];
-const CLASS: &str = "egui.Helper";
 const WATCHING: &str = "watching";
 const SHELL_ID: u32 = 2000;
-/// How long a helper may take to come up, and to answer once it has. Both are far more than it
-/// needs: on a busy system a paste that waits is better than one that brings the wrong text.
-const STARTUP: Duration = Duration::from_secs(5);
-const ANSWER: Duration = Duration::from_secs(1);
-/// Where touches come from nowhere else, the helper is given longer to say it has them.
-const WATCH_STARTUP: Duration = Duration::from_secs(10);
-/// A helper nobody has asked anything for this long is let go; it holds tens of megabytes.
-const IDLE: Duration = Duration::from_secs(30);
-const EXIT_POLL: Duration = Duration::from_millis(5);
 
 type Touches = Box<dyn FnMut(Motion) + Send>;
 
@@ -73,7 +63,8 @@ impl Helper {
     /// the system to let it.
     pub fn watch(touches: Touches) -> Result<Self> {
         let process = Process::start(User::Root, Some(touches))?;
-        match process.status.recv_timeout(WATCH_STARTUP) {
+        // Where touches come from nowhere else, the helper is given longer to say it has them.
+        match process.status.recv_timeout(Duration::from_secs(10)) {
             Ok(status) if status == WATCHING => Ok(Self { user: User::Root, process: Some(process), failed: false, watching: true }),
             Ok(refusal) => Err(err!("{refusal}")),
             Err(_) => Err(err!("the helper did not come up")),
@@ -87,10 +78,11 @@ impl Helper {
 
     /// Lets go of a helper that has not been needed for a while. It comes back when asked again.
     pub fn rest(&mut self) {
-        if !self.watching && self.process.as_ref().is_some_and(|process| process.used.elapsed() >= IDLE) {
+        // A helper nobody has asked anything for half a minute is let go; it holds tens of megabytes.
+        if !self.watching && self.process.as_ref().is_some_and(|process| process.used.elapsed() >= Duration::from_secs(30)) {
             // Its leaving takes a moment that the caller, drawing frames, should not wait out.
             let process = self.process.take();
-            let _ = std::thread::Builder::new().name("helper".into()).spawn(move || drop(process));
+            let _ = utils::spawn("helper", move || drop(process));
         }
     }
 
@@ -149,15 +141,16 @@ impl Clipboard for Helper {
                 return None;
             };
             let mut parts = reply.split(' ');
-            if parts.next().and_then(|number| number.parse().ok()) == Some(asked) {
+            if parts.next().and_then(utils::parse) == Some(asked) {
                 process.answered = true;
-                return parts.next().and_then(text);
+                return parts.next().and_then(utils::unhex);
             }
         }
     }
 
+    /// Text travels as hexadecimal UTF-8, which keeps line breaks out of the line protocol.
     fn write(&mut self, text: &str) {
-        self.send(&format!("copy {}", hex(text)));
+        self.send(&format!("copy {}", utils::hex(text)));
     }
 }
 
@@ -170,7 +163,7 @@ impl Process {
         let unpacked = std::fs::write(&dex, DEX).and_then(|()| std::fs::set_permissions(&dex, Permissions::from_mode(0o644)));
         unpacked.map_err(|error| err!("cannot unpack the helper: {error}"))?;
         let mut command = Command::new("app_process");
-        command.env("CLASSPATH", &dex).args(["/system/bin", CLASS]).args(touches.is_some().then_some("touches"));
+        command.env("CLASSPATH", &dex).args(["/system/bin", "egui.Helper"]).args(touches.is_some().then_some("touches"));
         if user == User::Shell {
             command.uid(SHELL_ID).gid(SHELL_ID);
         }
@@ -185,14 +178,16 @@ impl Process {
         let up = Arc::new(AtomicBool::new(false));
         let seen = up.clone();
         let unpacked = dex.clone();
-        let _ = std::thread::Builder::new().name("helper".into()).spawn(move || listen(replies, &unpacked, touches, &found, told, &seen));
+        let _ = utils::spawn("helper", move || listen(replies, &unpacked, touches, &found, told, &seen));
         let now = Instant::now();
         Ok(Self { child, dex, clips, status, up, started: now, used: now, asked: 0, answered: false })
     }
 
-    /// Until when to wait for the helper: it is slow only while it starts.
+    /// Until when to wait for the helper: it is slow only while it starts. It gets five seconds
+    /// to come up and a second to answer once it has. Both are far more than it needs: on a busy
+    /// system a paste that waits is better than one that brings the wrong text.
     fn patience(&self) -> Instant {
-        (self.started + STARTUP).max(Instant::now() + ANSWER)
+        (self.started + Duration::from_secs(5)).max(Instant::now() + Duration::from_secs(1))
     }
 }
 
@@ -202,7 +197,7 @@ impl Drop for Process {
         drop(self.child.stdin.take());
         let deadline = self.patience();
         while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
-            std::thread::sleep(EXIT_POLL);
+            std::thread::sleep(Duration::from_millis(5));
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -236,16 +231,4 @@ fn listen(replies: Option<impl std::io::Read>, dex: &str, mut touches: Option<To
             log::debug!("helper: {line}");
         }
     }
-}
-
-/// Text travels as hexadecimal UTF-8, which keeps line breaks out of the line protocol.
-fn hex(text: &str) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    text.bytes().flat_map(|byte| [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 15)]]).map(char::from).collect()
-}
-
-fn text(hex: &str) -> Option<String> {
-    let digit = |byte: u8| char::from(byte).to_digit(16);
-    let byte = |&[high, low]: &[u8; 2]| u8::try_from(digit(high)? << 4 | digit(low)?).ok();
-    String::from_utf8(hex.as_bytes().as_chunks().0.iter().map(byte).collect::<Option<Vec<u8>>>()?).ok()
 }

@@ -1,11 +1,6 @@
-use std::ffi::{CString, c_char, c_int};
+use std::ffi::CString;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
-
-#[link(name = "log")]
-unsafe extern "C" {
-    fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
-}
 
 struct Logger;
 
@@ -45,9 +40,24 @@ impl Log for Logger {
         let text = record.args().to_string();
         eprintln!("[{tag}] {text}");
         if let Ok(text) = CString::new(text) {
-            unsafe { __android_log_write(priority, c"android-egui".as_ptr(), text.as_ptr()) };
+            logcat::write(priority, &text);
         }
     }
 
     fn flush(&self) {}
+}
+
+/// The system's own log, read with `logcat`.
+#[allow(unsafe_code)]
+mod logcat {
+    use std::ffi::{CStr, c_char, c_int};
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    pub fn write(priority: c_int, text: &CStr) {
+        unsafe { __android_log_write(priority, c"android-egui".as_ptr(), text.as_ptr()) };
+    }
 }

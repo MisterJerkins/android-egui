@@ -1,34 +1,12 @@
 use egui::{Context, Event, FontId, Id, Key, LayerId, Modifiers, Order, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
 
 use super::{Language, REPEAT_DELAY, REPEAT_INTERVAL};
-use crate::input::Phase;
+use crate::input::touch::Phase;
 
 const ROWS: f32 = 4.0;
-const ROW_HEIGHT: f32 = 52.0;
-const MAX_WIDTH: f32 = 840.0;
-const WIDE: f32 = 1.5;
-
-const ENGLISH: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
-const RUSSIAN: [&str; 3] = ["йцукенгшщзхъ", "фывапролджэё", "ячсмитьбю"];
-const SYMBOLS: [&str; 3] = ["1234567890", "@#$%&-+()/", "*\"':;!?"];
-const MORE: [&str; 3] = ["~`|^=_{}[]", "<>\\€£¥°•√π", "÷×§©®™…"];
-
 const PLAIN: Modifiers = Modifiers::NONE;
 /// Ctrl, the way a hardware keyboard reports it.
 const COMMAND: Modifiers = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
-const REDO: Modifiers = Modifiers { shift: true, ..COMMAND };
-const EDITING: [&[Cap]; 3] = [
-    &[Cap::Key(Key::A, COMMAND), Cap::Cut, Cap::Copy, Cap::Paste],
-    &[
-        Cap::Key(Key::Home, PLAIN),
-        Cap::Key(Key::ArrowLeft, PLAIN),
-        Cap::Key(Key::ArrowUp, PLAIN),
-        Cap::Key(Key::ArrowDown, PLAIN),
-        Cap::Key(Key::ArrowRight, PLAIN),
-        Cap::Key(Key::End, PLAIN),
-    ],
-    &[Cap::Key(Key::Z, COMMAND), Cap::Key(Key::Z, REDO), Cap::Key(Key::Delete, PLAIN)],
-];
 
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Page {
@@ -131,7 +109,8 @@ impl Screen {
             *self = Self::default();
             return 0.0;
         }
-        let size = vec2((MAX_WIDTH / zoom).min(viewport.width()), (ROWS * ROW_HEIGHT / zoom).min(viewport.height() / 2.0));
+        // 840 points wide and 52 a row before zoom, and no more than the screen's width and half its height.
+        let size = vec2((840.0 / zoom).min(viewport.width()), (ROWS * 52.0 / zoom).min(viewport.height() / 2.0));
         let bounds = Rect::from_min_size(pos2(viewport.center().x - size.x / 2.0, viewport.bottom() - size.y), size);
         if self.bounds != Some(bounds) || self.language != language {
             (self.bounds, self.language) = (Some(bounds), language);
@@ -313,20 +292,33 @@ impl Screen {
 fn layout(page: Page, language: Language, bounds: Rect) -> Vec<Button> {
     let chars = |row: &str| row.chars().map(Cap::Char).collect::<Vec<_>>();
     let [first, second, mut third] = match (page, language) {
-        (Page::Letters, Language::English) => ENGLISH.map(chars),
-        (Page::Letters, Language::Russian) => RUSSIAN.map(chars),
-        (Page::Symbols, _) => SYMBOLS.map(chars),
-        (Page::More, _) => MORE.map(chars),
-        (Page::Edit, _) => EDITING.map(<[Cap]>::to_vec),
+        (Page::Letters, Language::English) => ["qwertyuiop", "asdfghjkl", "zxcvbnm"].map(chars),
+        (Page::Letters, Language::Russian) => ["йцукенгшщзхъ", "фывапролджэё", "ячсмитьбю"].map(chars),
+        (Page::Symbols, _) => ["1234567890", "@#$%&-+()/", "*\"':;!?"].map(chars),
+        (Page::More, _) => ["~`|^=_{}[]", "<>\\€£¥°•√π", "÷×§©®™…"].map(chars),
+        (Page::Edit, _) => [
+            vec![Cap::Key(Key::A, COMMAND), Cap::Cut, Cap::Copy, Cap::Paste],
+            vec![
+                Cap::Key(Key::Home, PLAIN),
+                Cap::Key(Key::ArrowLeft, PLAIN),
+                Cap::Key(Key::ArrowUp, PLAIN),
+                Cap::Key(Key::ArrowDown, PLAIN),
+                Cap::Key(Key::ArrowRight, PLAIN),
+                Cap::Key(Key::End, PLAIN),
+            ],
+            vec![Cap::Key(Key::Z, COMMAND), Cap::Key(Key::Z, Modifiers { shift: true, ..COMMAND }), Cap::Key(Key::Delete, PLAIN)],
+        ],
     };
     third.insert(0, if page == Page::Letters { Cap::Shift } else { Cap::More });
     third.push(Cap::Backspace);
     let rows = [first, second, third, vec![Cap::Symbols, Cap::Language, Cap::Char(','), Cap::Space, Cap::Char('.'), Cap::Enter]];
 
+    // A character key is one unit wide and any other key one and a half; the space bar is
+    // given what its row has left.
     let weight = |cap: &Cap| match cap {
         Cap::Char(_) => 1.0,
         Cap::Space => 0.0,
-        _ => WIDE,
+        _ => 1.5,
     };
     let total = |row: &Vec<Cap>| row.iter().map(weight).sum::<f32>();
     let units = rows.iter().map(total).fold(0.0, f32::max);

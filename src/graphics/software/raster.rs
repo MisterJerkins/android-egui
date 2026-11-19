@@ -1,6 +1,8 @@
 use egui::epaint::{ImageDelta, Mesh, Vertex};
 use egui::{ImageData, Rect, TextureFilter, TextureId, TextureWrapMode};
 
+use crate::graphics::texture_key;
+use crate::utils::{HASH_SEED, mix};
 use crate::window::Region;
 
 /// The column or row whose centre is the first one at or past `edge`: the pixels a shape covers
@@ -43,11 +45,6 @@ pub fn clip_region(clip: Rect, scale: f32) -> Region {
 }
 
 const TILE: i32 = 32;
-const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
-
-fn mix(hash: u64, value: u64) -> u64 {
-    (hash.rotate_left(5) ^ value).wrapping_mul(SEED)
-}
 
 /// Remembers what every tile of the screen showed, to find what a new frame changes. A tile
 /// is known by a hash of the triangles that reach into it, in drawing order.
@@ -76,12 +73,9 @@ impl Damage {
         self.next.resize((columns * rows).max(0) as usize, 0);
 
         for (mesh, clip) in meshes {
-            let texture = match mesh.texture_id {
-                TextureId::Managed(id) => id << 1,
-                TextureId::User(id) => id << 1 | 1,
-            };
-            let salt = [texture, clip.left as u64, clip.top as u64, clip.right as u64, clip.bottom as u64, if repainted(mesh.texture_id) { self.frame } else { 0 }];
-            let salt = salt.into_iter().fold(SEED, mix);
+            let salt =
+                [texture_key(mesh.texture_id), clip.left as u64, clip.top as u64, clip.right as u64, clip.bottom as u64, if repainted(mesh.texture_id) { self.frame } else { 0 }];
+            let salt = salt.into_iter().fold(HASH_SEED, mix);
             let words: &[[u32; size_of::<Vertex>() / 4]] = bytemuck::cast_slice(&mesh.vertices);
             self.corners.clear();
             self.corners.extend(words.iter().map(|vertex| vertex.iter().fold(salt, |hash, &word| mix(hash, word.into()))));

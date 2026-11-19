@@ -4,13 +4,10 @@ use std::sync::Arc;
 
 use egui_glow::glow::{self, HasContext};
 
-use crate::sys::dl::Library;
+use crate::utils::Library;
 use crate::{Result, bail};
 
 type Handle = *mut c_void;
-
-/// A driver keeps at most a handful of errors waiting to be read.
-const STALE_ERRORS: usize = 16;
 
 const NONE: i32 = 0x3038;
 const ALPHA_SIZE: i32 = 0x3021;
@@ -91,8 +88,8 @@ impl Context {
                 gles.as_ref().and_then(|library| library.find(name)).map_or(std::ptr::null(), |symbol| symbol.as_ptr().cast_const())
             });
             // Listing the extensions leaves an error behind on some drivers, which the painter
-            // would report as its own.
-            for _ in 0..STALE_ERRORS {
+            // would report as its own. A driver keeps at most a handful of errors waiting to be read.
+            for _ in 0..16 {
                 if gl.get_error() == glow::NO_ERROR {
                     break;
                 }
