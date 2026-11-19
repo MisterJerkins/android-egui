@@ -408,7 +408,7 @@ mod tests {
         }
 
         fn text(&self) -> String {
-            self.events.iter().filter_map(|event| if let Event::Text(text) = event { Some(text.as_str()) } else { None }).collect()
+            super::super::typed(&self.events)
         }
 
         fn presses(&self, wanted: Key) -> usize {

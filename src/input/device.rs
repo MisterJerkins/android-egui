@@ -57,6 +57,16 @@ pub struct RawEvent {
 }
 
 impl RawEvent {
+    /// Hands events written as `(kind, code, value)` to `feed` one by one and returns what they made.
+    #[cfg(test)]
+    pub fn replay<T>(events: &[(u16, u16, i32)], mut feed: impl FnMut(RawEvent, &mut Vec<T>)) -> Vec<T> {
+        let mut out = Vec::new();
+        for &(kind, code, value) in events {
+            feed(RawEvent { kind, code, value }, &mut out);
+        }
+        out
+    }
+
     /// Decodes kernel `input_event` records, whose timestamp takes `time_size` bytes.
     pub fn decode(bytes: &[u8], time_size: usize) -> impl Iterator<Item = RawEvent> + '_ {
         bytes.chunks_exact(time_size + 8).map(move |record| {
@@ -800,11 +810,7 @@ mod tests {
     }
 
     fn feed(parser: &mut DeviceParser, events: &[(u16, u16, i32)]) -> Vec<Sample> {
-        let mut out = Vec::new();
-        for &(kind, code, value) in events {
-            parser.feed(RawEvent { kind, code, value }, Duration::ZERO, &mut out);
-        }
-        out
+        RawEvent::replay(events, |event, out| parser.feed(event, Duration::ZERO, out))
     }
 
     #[test]

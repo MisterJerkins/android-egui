@@ -448,11 +448,7 @@ mod tests {
     }
 
     fn feed(parser: &mut TouchParser, now: Duration, events: &[(u16, u16, i32)]) -> Vec<Contact> {
-        let mut out = Vec::new();
-        for &(kind, code, value) in events {
-            parser.feed(RawEvent { kind, code, value }, now, &mut out);
-        }
-        out
+        RawEvent::replay(events, |event, out| parser.feed(event, now, out))
     }
 
     fn phases(contacts: &[Contact]) -> Vec<(u32, Phase)> {

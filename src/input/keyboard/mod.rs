@@ -397,6 +397,12 @@ impl Physical {
     }
 }
 
+/// The text a run of events types, for the tests of both keyboards.
+#[cfg(test)]
+fn typed(events: &[Event]) -> String {
+    events.iter().filter_map(|event| if let Event::Text(text) = event { Some(text.as_str()) } else { None }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use egui::{RawInput, TextEdit, pos2};
@@ -616,10 +622,6 @@ mod tests {
     }
 
     const ENGLISH: Language = Language::English;
-
-    fn typed(events: &[Event]) -> String {
-        events.iter().filter_map(|event| if let Event::Text(text) = event { Some(text.as_str()) } else { None }).collect()
-    }
 
     #[test]
     fn characters_follow_language_shift_and_caps() {
