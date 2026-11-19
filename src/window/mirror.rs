@@ -43,7 +43,7 @@ mod worker {
     use std::collections::HashMap;
     use std::collections::hash_map::Entry;
     use std::process::Command;
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -70,12 +70,6 @@ mod worker {
     struct Shared {
         state: Mutex<State>,
         wake: Condvar,
-    }
-
-    impl Shared {
-        fn lock(&self) -> MutexGuard<'_, State> {
-            utils::lock(&self.state)
-        }
     }
 
     struct Copy {
@@ -110,14 +104,14 @@ mod worker {
         pub fn follow(&mut self, layer: Option<(Handle, [u32; 2])>) {
             self.version += 1;
             let source = layer.map(|(layer, size)| Source { layer, size, version: self.version });
-            self.shared.lock().source = source;
+            utils::lock(&self.shared.state).source = source;
             self.shared.wake.notify_one();
         }
     }
 
     impl Drop for Mirrors {
         fn drop(&mut self) {
-            self.shared.lock().stop = true;
+            utils::lock(&self.shared.state).stop = true;
             self.shared.wake.notify_one();
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
@@ -131,7 +125,7 @@ mod worker {
         let mut version = 0;
         loop {
             let (source, stop) = {
-                let state = shared.lock();
+                let state = utils::lock(&shared.state);
                 (state.source.clone(), state.stop)
             };
             if stop {
@@ -140,7 +134,7 @@ mod worker {
             let Some(source) = source else {
                 // Nothing to mirror, so nothing to watch for either, until there is.
                 copies.clear();
-                drop(shared.wake.wait_while(shared.lock(), |state| state.source.is_none() && !state.stop));
+                drop(shared.wake.wait_while(utils::lock(&shared.state), |state| state.source.is_none() && !state.stop));
                 continue;
             };
             if source.version != version {
@@ -173,7 +167,7 @@ mod worker {
 
             // The next look is a second away, or as soon as the layer to mirror changes.
             let same = |state: &mut State| !state.stop && state.source.as_ref().is_some_and(|source| source.version == version);
-            drop(shared.wake.wait_timeout_while(shared.lock(), Duration::from_secs(1), same));
+            drop(shared.wake.wait_timeout_while(utils::lock(&shared.state), Duration::from_secs(1), same));
         }
     }
 }

@@ -809,21 +809,21 @@ mod tests {
         DeviceParser::new(&device, &classify(&device, &Idc::default(), None))
     }
 
-    fn feed(parser: &mut DeviceParser, events: &[(u16, u16, i32)]) -> Vec<Sample> {
-        RawEvent::replay(events, |event, out| parser.feed(event, Duration::ZERO, out))
-    }
-
     #[test]
     fn mouse_reports_position_before_the_click() {
         let mut parser = mouse();
-        let samples = feed(&mut parser, &[(EV_KEY, BTN_LEFT, 1), (EV_ABS, ABS_X, 32768), (EV_ABS, ABS_Y, 16384), (EV_SYN, SYN_REPORT, 0)]);
+        let samples = RawEvent::replay(&[(EV_KEY, BTN_LEFT, 1), (EV_ABS, ABS_X, 32768), (EV_ABS, ABS_Y, 16384), (EV_SYN, SYN_REPORT, 0)], |event, out| {
+            parser.feed(event, Duration::ZERO, out)
+        });
         assert_eq!(samples, [Sample::Hover { u: 0.5, v: 0.25 }, Sample::Button { button: MouseButton::Left, pressed: true }]);
     }
 
     #[test]
     fn wheel_steps_accumulate_per_frame() {
         let mut parser = mouse();
-        let samples = feed(&mut parser, &[(EV_REL, REL_WHEEL, 1), (EV_REL, REL_WHEEL, 1), (EV_REL, REL_HWHEEL, -1), (EV_SYN, SYN_REPORT, 0)]);
+        let samples = RawEvent::replay(&[(EV_REL, REL_WHEEL, 1), (EV_REL, REL_WHEEL, 1), (EV_REL, REL_HWHEEL, -1), (EV_SYN, SYN_REPORT, 0)], |event, out| {
+            parser.feed(event, Duration::ZERO, out)
+        });
         assert_eq!(samples, [Sample::Wheel { x: -1.0, y: 2.0 }]);
     }
 
@@ -831,7 +831,7 @@ mod tests {
     fn keyboard_ignores_mouse_buttons() {
         let device = device("", 0, &[KEY_A], &[], &[]);
         let mut parser = DeviceParser::new(&device, &classify(&device, &Idc::default(), None));
-        let samples = feed(&mut parser, &[(EV_KEY, 30, 1), (EV_KEY, BTN_LEFT, 1), (EV_KEY, 30, 2), (EV_KEY, 30, 0)]);
+        let samples = RawEvent::replay(&[(EV_KEY, 30, 1), (EV_KEY, BTN_LEFT, 1), (EV_KEY, 30, 2), (EV_KEY, 30, 0)], |event, out| parser.feed(event, Duration::ZERO, out));
         assert_eq!(
             samples,
             [

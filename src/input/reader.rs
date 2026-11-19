@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use egui::{AreaState, Context, Order, PlatformOutput, Rect, pos2};
@@ -288,13 +288,9 @@ impl Hub {
         hub
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        utils::lock(&self.state)
-    }
-
     /// Hands over the latest view and takes the previous one back, so its buffers are reused.
     fn swap_view(&self, view: &mut View) {
-        std::mem::swap(&mut self.lock().routing.view, view);
+        std::mem::swap(&mut utils::lock(&self.state).routing.view, view);
     }
 
     /// Whether there is a touchscreen among the input devices. The answer waits until all of
@@ -303,7 +299,7 @@ impl Hub {
     fn has_screen(&self, patience: Duration) -> bool {
         let until = Instant::now() + patience;
         loop {
-            let state = self.lock();
+            let state = utils::lock(&self.state);
             if state.devices.values().any(|device| device.screen) {
                 return true;
             }
@@ -319,9 +315,9 @@ impl Hub {
     /// returns where to send the system's.
     fn system_touches(self: &Arc<Self>, enabled: bool) -> impl FnMut(Motion) + Send + 'static {
         let hub = self.clone();
-        hub.lock().routing.system = enabled;
+        utils::lock(&hub.state).routing.system = enabled;
         move |motion| {
-            let mut state = hub.lock();
+            let mut state = utils::lock(&hub.state);
             let Routing { view, router, queue, events, .. } = &mut state.routing;
             for (contact, position) in motion.contacts() {
                 // Touches reported by the system go under the device number zero.
@@ -336,7 +332,7 @@ impl Hub {
     /// Blocks until input is waiting or `timeout` passes. Returns whether input is waiting.
     fn wait(&self, timeout: Duration) -> bool {
         let until = Instant::now() + timeout;
-        let mut state = self.lock();
+        let mut state = utils::lock(&self.state);
         loop {
             let now = self.started.elapsed();
             let deadline = state.tick(now);
@@ -354,7 +350,7 @@ impl Hub {
 
     /// Takes the input for one frame; whatever is left makes [`Hub::wait`] return at once.
     fn drain(&self, into: &mut Vec<Event>) -> Taken {
-        let mut state = self.lock();
+        let mut state = utils::lock(&self.state);
         let at = state.routing.queue.take_frame(into);
         Taken { at, kept: std::mem::take(&mut state.routing.kept) }
     }
@@ -452,7 +448,7 @@ impl State {
 
 impl Devices for Hub {
     fn set_control(&self, enabled: bool) -> Result<()> {
-        let mut state = self.lock();
+        let mut state = utils::lock(&self.state);
         let now = self.started.elapsed();
         if enabled && state.routing.control.is_none() {
             let device = virtual_touchscreen(VIRTUAL_TOUCHSCREEN, RANGE, SLOTS).map_err(|error| err!("cannot create a virtual touchscreen: {error}"))?;
@@ -466,16 +462,16 @@ impl Devices for Hub {
     }
 
     fn is_control(&self) -> bool {
-        self.lock().routing.controlling
+        utils::lock(&self.state).routing.controlling
     }
 
     fn finger(&self, finger: u32, phase: Phase, position: [f32; 2]) -> Result<()> {
-        let mut state = self.lock();
+        let mut state = utils::lock(&self.state);
         let settling = state.routing.control.as_ref().map_or(Duration::ZERO, |control| control.ready.saturating_sub(self.started.elapsed()));
         if !settling.is_zero() {
             drop(state);
             std::thread::sleep(settling);
-            state = self.lock();
+            state = utils::lock(&self.state);
         }
         let Routing { view, control, controlling, .. } = &mut state.routing;
         let Some(control) = control.as_mut().filter(|_| *controlling) else { bail!("touch control is off") };
@@ -487,7 +483,7 @@ impl Devices for Hub {
     }
 
     fn describe(&self) -> Vec<String> {
-        let state = self.lock();
+        let state = utils::lock(&self.state);
         let mut lines: Vec<String> = state
             .devices
             .values()
@@ -530,7 +526,7 @@ fn scan(hub: &Arc<Hub>, display: Option<&str>) {
             let index = next_index;
             log::debug!("input device {name}: {} {:?}", device.name, device.roles);
 
-            let mut state = hub.lock();
+            let mut state = utils::lock(&hub.state);
             state.devices.insert(index, device);
             state.pick_screens();
             restore(&mut state, index, &file);
@@ -540,7 +536,7 @@ fn scan(hub: &Arc<Hub>, display: Option<&str>) {
             let reader = hub.clone();
             let _ = utils::spawn(format!("input-{name}"), move || read(&reader, index, &file));
         }
-        hub.lock().scanned = true;
+        utils::lock(&hub.state).scanned = true;
         // Devices come and go rarely, and their directories tell when: no looking in between.
         let changed = watch.as_mut().is_some_and(Watch::wait);
         // A device that has just appeared gets a moment for its owner and mode to be set. Where
@@ -600,7 +596,7 @@ fn read(hub: &Hub, index: u32, mut file: &File) {
             Err(_) => break,
         };
         let now = hub.started.elapsed();
-        let mut state = hub.lock();
+        let mut state = utils::lock(&hub.state);
         let State { devices, samples, routing, .. } = &mut *state;
         let Some(device) = devices.get_mut(&index) else { return };
         let mut resync = false;
@@ -626,7 +622,7 @@ fn read(hub: &Hub, index: u32, mut file: &File) {
         }
     }
 
-    let mut state = hub.lock();
+    let mut state = utils::lock(&hub.state);
     let State { devices, samples, routing, .. } = &mut *state;
     if let Some(mut device) = devices.remove(&index) {
         device.parser.cancel(samples);
