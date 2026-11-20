@@ -4,7 +4,7 @@ use std::mem::MaybeUninit;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 
-use super::{ANativeWindow, Capture, FORMAT_RGBA_8888};
+use super::{ANativeWindow, BlurRegion, Capture, FORMAT_RGBA_8888};
 use crate::utils::{self, Library};
 use crate::{Result, bail, err};
 
@@ -13,6 +13,7 @@ pub type Ptr = *mut c_void;
 const FLAG_SKIP_SCREENSHOT: u32 = 0x40;
 const FLAG_SECURE: u32 = 0x80;
 const FLAG_CONTAINER: u32 = 0x4000;
+const FLAG_EFFECT: u32 = 0x2_0000;
 const WINDOW_TYPE_DONT_SCREENSHOT: i32 = 441_731;
 const METADATA_WINDOW_TYPE: u32 = 2;
 const TRUSTED_OVERLAY_ENABLED: i32 = 2;
@@ -185,7 +186,6 @@ enum CopyLayer {
 struct Mirroring {
     copy: CopyLayer,
     set_stack: unsafe extern "C" fn(Ptr, *const Ptr, u32) -> Ptr,
-    reparent: unsafe extern "C" fn(Ptr, *const Ptr, *const Ptr) -> Ptr,
     set_matrix: unsafe extern "C" fn(Ptr, *const Ptr, f32, f32, f32, f32) -> Ptr,
     set_position: unsafe extern "C" fn(Ptr, *const Ptr, f32, f32) -> Ptr,
 }
@@ -196,6 +196,14 @@ struct Transact {
     show: TxControl,
     hide: TxControl,
     set_size: Option<TxSize>,
+    reparent: Option<unsafe extern "C" fn(Ptr, *const Ptr, *const Ptr) -> Ptr>,
+    /// Takes three half-precision numbers: red, green, blue.
+    set_color: Option<unsafe extern "C" fn(Ptr, *const Ptr, *const [u16; 3]) -> Ptr>,
+    /// Takes a `std::vector<BlurRegion>` of the system's C++ library by reference: three
+    /// pointers - first, one past the last, end of storage.
+    set_blur_regions: Option<unsafe extern "C" fn(Ptr, *const Ptr, *const [*const BlurRegion; 3]) -> Ptr>,
+    /// Takes nanoseconds on the clock that does not stop or jump.
+    set_desired_present_time: Option<unsafe extern "C" fn(Ptr, i64) -> Ptr>,
     trusted: Option<Trusted>,
     apply: Apply,
 }
@@ -257,6 +265,14 @@ impl Resolver<'_> {
     unsafe fn required<F: Copy>(&mut self, what: &'static str, symbols: &[&'static CStr]) -> Result<F> {
         unsafe { self.optional(what, symbols) }.ok_or_else(|| err!("{what} is missing from the system library"))
     }
+}
+
+/// What a layer is: one with buffers to draw into, a bare holder of other layers, or one the
+/// system draws by itself, with no picture of its own.
+pub enum LayerKind {
+    Drawn,
+    Container,
+    Effect,
 }
 
 pub struct DisplayState {
@@ -380,7 +396,6 @@ impl LibGui {
                     "Transaction::setLayerStack",
                     &[c"_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE"],
                 )?,
-                reparent: gui.optional("Transaction::reparent", &[c"_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_"])?,
                 set_matrix: gui.optional("Transaction::setMatrix", &[c"_ZN7android21SurfaceComposerClient11Transaction9setMatrixERKNS_2spINS_14SurfaceControlEEEffff"])?,
                 set_position: gui.optional("Transaction::setPosition", &[c"_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff"])?,
             })
@@ -431,6 +446,19 @@ impl LibGui {
                 show: gui.required("Transaction::show", &[c"_ZN7android21SurfaceComposerClient11Transaction4showERKNS_2spINS_14SurfaceControlEEE"])?,
                 hide: gui.required("Transaction::hide", &[c"_ZN7android21SurfaceComposerClient11Transaction4hideERKNS_2spINS_14SurfaceControlEEE"])?,
                 set_size: gui.optional("Transaction::setSize", &[c"_ZN7android21SurfaceComposerClient11Transaction7setSizeERKNS_2spINS_14SurfaceControlEEEjj"]),
+                reparent: gui.optional("Transaction::reparent", &[c"_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_"]),
+                set_color: gui.optional(
+                    "Transaction::setColor",
+                    &[c"_ZN7android21SurfaceComposerClient11Transaction8setColorERKNS_2spINS_14SurfaceControlEEERKNS_7details5TVec3INS_4halfEEE"],
+                ),
+                set_blur_regions: gui.optional(
+                    "Transaction::setBlurRegions",
+                    &[c"_ZN7android21SurfaceComposerClient11Transaction14setBlurRegionsERKNS_2spINS_14SurfaceControlEEERKNSt3__16vectorINS_10BlurRegionENS7_9allocatorIS9_EEEE"],
+                ),
+                set_desired_present_time: gui.optional(
+                    "Transaction::setDesiredPresentTime",
+                    &[c"_ZN7android21SurfaceComposerClient11Transaction21setDesiredPresentTimeEl", c"_ZN7android21SurfaceComposerClient11Transaction21setDesiredPresentTimeEx"],
+                ),
                 trusted,
                 apply,
             }))
@@ -537,11 +565,15 @@ impl LibGui {
         }
     }
 
-    /// Creates a layer with buffers to draw into, or a bare container for other layers.
-    pub fn create_surface(&self, client: Ptr, name: &CStr, width: u32, height: u32, capture: Capture, container: bool) -> Result<Ptr> {
+    pub fn create_surface(&self, client: Ptr, name: &CStr, width: u32, height: u32, capture: Capture, layer_kind: LayerKind) -> Result<Ptr> {
         let (function, kind) = self.create;
         let hidden = capture == Capture::Hidden;
-        let mut flags = if capture == Capture::Secure { FLAG_SECURE } else { 0 } | if container { FLAG_CONTAINER } else { 0 };
+        let of_kind = match layer_kind {
+            LayerKind::Drawn => 0,
+            LayerKind::Container => FLAG_CONTAINER,
+            LayerKind::Effect => FLAG_EFFECT,
+        };
+        let mut flags = if capture == Capture::Secure { FLAG_SECURE } else { 0 } | of_kind;
         let mut metadata = Storage::<512>::new();
         let mut name8 = Storage::<64>::new();
 
@@ -699,14 +731,62 @@ impl LibGui {
         }
     }
 
+    pub fn can_blur(&self) -> bool {
+        matches!(&self.ops, Ops::Transact(Transact { set_blur_regions: Some(_), reparent: Some(_), set_color: Some(_), .. }))
+    }
+
+    /// Makes the layer the blur is asked on: one with no picture of its own, under the picture
+    /// of `parent` and captured as that is. The system blurs under the parts of a layer only
+    /// where it draws that layer, and before Android 14 it does not draw the one a window
+    /// belongs to: the window's picture is on a layer of its own inside it.
+    pub fn create_blur_layer(&self, client: Ptr, transaction: Ptr, parent: Ptr, capture: Capture) -> Result<Handle> {
+        let Ops::Transact(transact @ Transact { set_blur_regions: Some(_), reparent: Some(reparent), set_color: Some(set_color), .. }) = &self.ops else {
+            bail!("this system does not blur what is under a layer");
+        };
+        // Android 12 takes such a layer only without a size.
+        let made = Handle::adopt(self.create_surface(client, c"android-egui blur", 0, 0, capture, LayerKind::Effect)?);
+        let layer = made.as_ptr();
+        unsafe {
+            reparent(transaction, &layer, &parent);
+            // Under the layer inside the same parent that has the window's picture, and without
+            // the colour such a layer is otherwise filled with: minus one, three times over, is
+            // no colour.
+            (transact.set_layer)(transaction, &layer, -1);
+            set_color(transaction, &layer, &[0xbc00; 3]);
+            (transact.show)(transaction, &layer);
+            self.apply(transact, transaction)?;
+        }
+        Ok(made)
+    }
+
+    /// Blurs what is under the given parts of a layer; none of them, no blur. With `shown_at`,
+    /// in nanoseconds on the system's clock, the change waits in the system for the frame that
+    /// is shown at that moment.
+    pub fn set_blur(&self, transaction: Ptr, control: Ptr, regions: &[BlurRegion], shown_at: Option<i64>) -> Result<()> {
+        let Ops::Transact(transact @ Transact { set_blur_regions: Some(set), .. }) = &self.ops else {
+            bail!("this system does not blur what is under a layer");
+        };
+        // The call copies the vector it is given.
+        let all = regions.as_ptr_range();
+        unsafe {
+            set(transaction, &control, &[all.start, all.end, all.end]);
+            if let (Some(shown_at), Some(wait)) = (shown_at, transact.set_desired_present_time) {
+                wait(transaction, shown_at);
+            }
+            self.apply(transact, transaction)
+        }
+    }
+
     pub fn can_mirror(&self) -> bool {
-        self.mirroring.is_some()
+        self.mirroring.is_some() && matches!(&self.ops, Ops::Transact(Transact { reparent: Some(_), .. }))
     }
 
     /// Shows a copy of `layer` on the display with the given layer stack, inside a container
     /// that [`LibGui::place`] can scale and move. Returns the copy and its container.
     pub fn mirror(&self, client: Ptr, transaction: Ptr, layer: Ptr, [width, height]: [u32; 2], stack: u32) -> Result<[Handle; 2]> {
-        let (Ops::Transact(transact), Some(mirroring)) = (&self.ops, &self.mirroring) else { bail!("layers cannot be mirrored on this system") };
+        let (Ops::Transact(transact @ Transact { reparent: Some(reparent), .. }), Some(mirroring)) = (&self.ops, &self.mirroring) else {
+            bail!("layers cannot be mirrored on this system")
+        };
         unsafe {
             let copy = match mirroring.copy {
                 CopyLayer::Plain(mirror) => mirror(client, layer).value,
@@ -716,14 +796,14 @@ impl LibGui {
                 bail!("SurfaceFlinger refused to mirror the layer");
             }
             let copy = Handle::adopt(copy);
-            let root = Handle::adopt(self.create_surface(client, c"android-egui mirror", width, height, Capture::Visible, true)?);
+            let root = Handle::adopt(self.create_surface(client, c"android-egui mirror", width, height, Capture::Visible, LayerKind::Container)?);
             let (inner, outer) = (copy.as_ptr(), root.as_ptr());
             (transact.set_layer)(transaction, &outer, i32::MAX);
             (mirroring.set_stack)(transaction, &outer, stack);
             (transact.show)(transaction, &outer);
             (mirroring.set_stack)(transaction, &inner, stack);
             (transact.show)(transaction, &inner);
-            (mirroring.reparent)(transaction, &inner, &outer);
+            reparent(transaction, &inner, &outer);
             self.apply(transact, transaction)?;
             Ok([copy, root])
         }

@@ -26,7 +26,7 @@ fn main() -> Result<()> {
 ```
 
 thats the whole thing: a window over the screen, graphics that draw into it, touches. the full
-demo (menu, scale slider, capture modes, touch control, moving "items") is
+demo (menu, scale and blur sliders, capture modes, touch control, moving "items") is
 [src/main.rs](src/main.rs), ~80 lines.
 
 ## Quick start
@@ -58,6 +58,7 @@ first arg picks the backend: `auto` (default), `gl`, `vk`, `cpu`.
 | capture | `Capture::Visible / Hidden / Secure` - keep the overlay out of screenshots and recordings |
 | mirroring | on android 14+ recorders only see window manager layers, so they miss the overlay. `window.set_mirroring(true)` copies it onto the recording display. off by default, and does nothing while the overlay is hidden |
 | draw | plain egui: a painter on the background layer draws lines, boxes, circles, text and pictures under the windows and never takes touches |
+| blur | android 12+: the screen behind the menu blurred by the system's own compositor - behind every window (`blur.set_window_radius`) or behind any rectangle you draw (`blur.rect`, shaped like `painter.rect_filled`). nothing is drawn for it here, and the overlay does not redraw when what is behind it changes |
 | pictures | PNG / JPEG from memory or a file, or raw RGBA. works the same on all three backends |
 | no evdev | containers without touch devices: touches come from the system input monitor (android 10+) |
 
@@ -83,6 +84,11 @@ build thats in Releases.
 
 "-" means that android version doesnt have the feature (recorders before 14 grab the whole
 screen anyway, input monitor showed up in 10).
+
+the blur was checked wherever the system has one: the tablet and the android 12, 13, 14 and 16
+emulators, all three backends - a wide window, a small one, a grid of rounded rectangles, and an
+overlay hidden from screenshots, which takes its blur out of them too. on android 7 and 9, which
+have none, the same scenes run and the screen stays as it was.
 
 not checked, because the test images dont have it:
 
@@ -135,6 +141,24 @@ tablet, Snapdragon 8 Elite (8 cores), 2400×1504 @ 60 Hz, android 15, release bu
 - all three backends draw the same picture: on every tested android they differ by 1-2 brightness
   levels in a few hundred pixels out of millions
 
+the blur, same tablet, a page animating at 60 fps under an overlay that stands still:
+
+| | compositor | gpu, of its full speed | overlay |
+|---|---|---|---|
+| no blur | ~21 % of one core | ~1.4 % | ~0.4 % of one core |
+| blur - any radius, any size, 1 to 64 parts | ~39 % | ~6.5 % | ~0.4 % |
+| 2 / 3 different radii in one frame | ~46 % / ~55 % | ~10 % / ~13 % | ~0.4 % |
+
+- the system does the blurring, so thats where the cost is: with a blur on screen its compositor
+  puts every frame together on the gpu and blurs it once per radius. the gpu stays at its lowest
+  clock through all of it
+- nothing moving behind the overlay - nothing spent: on a still screen the compositor does not run
+- the radius and the size are free, the number of *different* radii is not. 16 at once took half
+  the gpu and 64 dropped frames, so a frame gets three at most and a fourth takes the nearest
+- dragging a blurred window costs the overlay what dragging a plain one does (~11 % of a core on
+  Vulkan), and the blur stays on the window to the frame - checked frame by frame in a 60 fps
+  recording, all three backends
+
 ## API
 
 three steps, three values you own:
@@ -147,6 +171,7 @@ let touch = Touch::init(&mut graphics)?;                            // input thr
 graphics.frame(|ui| { ... })?;                    // one frame; sleeps until there is something to draw
 graphics.context();                               // egui::Context: style, fonts, zoom
 graphics.name();                                  // the backend in use
+graphics.blur().set_window_radius(18.0);          // the screen behind every window, blurred (android 12+)
 window.display();                                 // size, rotation, density
 window.set_capture(Capture::Hidden)?;             // hide from screenshots and recordings
 window.set_mirroring(true);                       // or show up in android 14+ recorders (off by default)
@@ -179,6 +204,33 @@ painter.line_segment([point(x, y), point(x2, y2)], Stroke::new(2.0 * pixel, Colo
 painter.rect_stroke(frame, 0.0, Stroke::new(3.0 * pixel, Color32::GREEN), StrokeKind::Middle);
 painter.text(point(x, y - 98.0), Align2::CENTER_BOTTOM, "item", FontId::proportional(30.0 * pixel), Color32::WHITE);
 ```
+
+blur - the screen behind the menu, blurred. its the system's own blur (the one behind the
+notification shade), not a shader of ours: nothing extra is drawn, and it follows whatever moves
+behind the overlay without the overlay redrawing.
+
+```rust
+let blur = graphics.blur();                      // cheap to clone, every clone is the same blur
+blur.set_window_radius(18.0);                    // behind every window, in points. 0.0 turns it off
+
+while graphics.frame(|ui| {
+    let frame = Frame::window(ui.style()).multiply_with_opacity(0.45);   // the blur shows through what is not solid
+    egui::Window::new("Menu").frame(frame).show(ui.ctx(), |ui| ui.label("hello"));
+
+    let painter = ui.ctx().layer_painter(LayerId::background());         // or behind anything you draw yourself:
+    let place = Rect::from_min_size(pos2(40.0, 40.0), vec2(120.0, 80.0));
+    blur.rect(&painter, place, 8, 24.0);                                 // rect, corner radius, blur radius
+    painter.rect_filled(place, 8, Color32::from_black_alpha(90));
+})? {}
+```
+
+`blur.rect` takes the painter you draw the thing with and puts the blur exactly where
+`painter.rect_filled` with the same rectangle and corners would draw: same place, same rounding,
+same clipping. it lasts one frame, like everything a painter draws. a "window" for
+`set_window_radius` is whatever egui floats above the background - menus, tooltips and a bare
+`Area` too. `blur.available()` says whether this system can blur at all; where it cant, the calls
+just do nothing. keep to one radius when you can - every other radius in a frame is another pass
+over the screen for the system.
 
 pictures - load once before the loop, draw as much as you want:
 
@@ -251,8 +303,10 @@ src/
     main.rs         the demo
     lib.rs          crate root: exports
     utils/          error type, shared helpers, dlopen, properties, inotify, ioctl, the logger
-    window/         ANativeWindowCreator, NativeWindow: libgui (C++ ABI), the layer, mirrors for recorders
-    graphics/       Graphics - the frame loop: input -> egui -> backend; picture loading
+    window/         ANativeWindowCreator, NativeWindow: libgui (C++ ABI), the layer, mirrors for recorders,
+                    the display's refresh
+    graphics/       Graphics - the frame loop: input -> egui -> backend; picture loading; Blur - the
+                    screen behind, blurred
         opengl/     OpenGL ES backend, EGL
         vulkan/     Vulkan backend, shaders
         software/   CPU backend, rasterizer
@@ -265,7 +319,7 @@ tools/              build scripts
 ```
 
 `unsafe` only lives where it has to: `utils::ffi`, `utils::logger::logcat`, `window::libgui`,
-`window::native`, `graphics::vsync`, `graphics::opengl::egl`, `graphics::vulkan`. the rest of the
+`window::native`, `window::vsync`, `graphics::opengl::egl`, `graphics::vulkan`. the rest of the
 crate is `#![deny(unsafe_code)]`.
 
 ## Good to know
@@ -281,6 +335,10 @@ crate is `#![deny(unsafe_code)]`.
   because it has to ask the system for its displays once a second (~2 % of a core, plus a
   `dumpsys` run each time). with it on, the first second of a recording can still be without the
   overlay, until the mirror picks up the new recording display
+- the blur needs android 12+ and a device whose compositor is built with it (most are; the
+  `ro.surface_flinger.supports_background_blur` property says). it lies under everything the
+  overlay draws, so it shows only through what is not solid - give the windows a see-through
+  frame
 - fonts are egui's built-in ones. need CJK or anything else - add your own through
   `graphics.context()`
 

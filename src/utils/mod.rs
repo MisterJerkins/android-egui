@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 #[cfg(target_os = "android")]
-pub use ffi::{Library, Watch, ioctl_get, ioctl_set};
+pub use ffi::{Library, Watch, ioctl_get, ioctl_set, property};
 
 #[derive(Debug)]
 pub struct Error(String);

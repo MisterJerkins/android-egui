@@ -1,6 +1,6 @@
 [package]
 name = "android-egui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "egui overlay for Android drawn from a root binary through SurfaceFlinger"
 license = "MIT"

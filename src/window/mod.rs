@@ -5,6 +5,9 @@
 #[allow(unsafe_code)]
 mod libgui;
 mod mirror;
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+mod vsync;
 
 #[cfg(target_os = "android")]
 pub use android::{ANativeWindowCreator, NativeWindow, Probe};
@@ -88,6 +91,22 @@ impl Region {
     }
 }
 
+/// A part of the layer under which the system blurs the screen, in the layer's own pixels and
+/// laid out the way the system's library takes it. Whatever the layer draws there goes on top
+/// of the blurred picture, so it shows where the layer is not opaque.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub(crate) struct BlurRegion {
+    pub radius: u32,
+    /// Top left, top right, bottom left, bottom right.
+    pub corners: [f32; 4],
+    pub alpha: f32,
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
 #[cfg(target_os = "android")]
 mod android {
     use std::cell::{Cell, RefCell};
@@ -95,10 +114,11 @@ mod android {
     use std::rc::{Rc, Weak};
     use std::time::Duration;
 
-    use super::libgui::{Handle, LibGui, Ptr};
+    use super::libgui::{Handle, LayerKind, LibGui, Ptr};
     use super::mirror::Mirrors;
     use super::native::{ANativeWindow, Buffer};
-    use super::{Capture, Display, Rotation};
+    use super::vsync::{self, Vsync};
+    use super::{BlurRegion, Capture, Display, Rotation};
     use crate::graphics::Backend;
     use crate::utils::{self, logger};
     use crate::{Result, bail, err};
@@ -115,8 +135,19 @@ mod android {
             let composer = Composer::connect()?;
             let display = composer.display()?;
             let layer = composer.create_layer(name, display.width, display.height, Capture::Visible)?;
-            let state =
-                State { mirrors: None, mirroring: false, layer, untouched: true, composer, display, name: name.to_owned(), capture: Capture::Visible, drawing: None, changes: 0 };
+            let state = State {
+                mirrors: None,
+                mirroring: false,
+                layer,
+                untouched: true,
+                composer,
+                display,
+                name: name.to_owned(),
+                capture: Capture::Visible,
+                drawing: None,
+                changes: 0,
+                blur: Vec::new(),
+            };
             Ok(NativeWindow(Rc::new(RefCell::new(state))))
         }
 
@@ -171,6 +202,8 @@ mod android {
         drawing: Option<Weak<RefCell<dyn Backend>>>,
         /// How many times the layer was replaced or resized.
         changes: u64,
+        /// The parts of the layer the system blurs under, kept for the layer that replaces this one.
+        blur: Vec<BlurRegion>,
     }
 
     impl NativeWindow {
@@ -232,9 +265,40 @@ mod android {
             self.0.borrow().composer.display_id()
         }
 
-        /// Time between two display refreshes, where the system reports it with the display.
-        pub(crate) fn refresh_period(&self) -> Option<Duration> {
-            self.0.borrow().composer.reported_period.get()
+        /// When the display takes its frames, where the system tells.
+        pub(crate) fn vsync(&self) -> Option<Vsync> {
+            // An old system says with the display how often it takes a frame, and not when.
+            vsync::get().or_else(|| self.0.borrow().composer.reported_period.get().map(Vsync::anytime))
+        }
+
+        /// Whether the system blurs what is under a layer: Android 12 and later, on devices
+        /// whose compositor is built for it, which it says in this property.
+        pub(crate) fn can_blur(&self) -> bool {
+            self.0.borrow().composer.gui.can_blur() && utils::property(c"ro.surface_flinger.supports_background_blur").as_deref() == Some("1")
+        }
+
+        /// Blurs the screen under the given parts of the layer; none of them, no blur. The system
+        /// does the blurring itself, every time what is underneath changes, with nothing drawn
+        /// here. To be called before the frame drawn for the change goes to the window: the two
+        /// are then shown in the same display frame. What fails is not tried again until the
+        /// parts change.
+        pub(crate) fn set_blur(&self, regions: &[BlurRegion]) -> Result<()> {
+            let state = &mut *self.0.borrow_mut();
+            if regions == state.blur {
+                // The frame drawn for the last change has gone: those after it are shown as soon as they can be.
+                state.layer.stamp(None);
+                return Ok(());
+            }
+            state.blur = regions.to_vec();
+            // The system takes a change like this at once, and a frame only after its turn in the
+            // window's queue, two of the display's frames later: a blur that moves with what is
+            // drawn would run ahead of it. So the change and the frame drawn for it are both told
+            // to be shown at one moment that far ahead, which keeps the frame no longer than the
+            // queue does anyway.
+            let period = vsync::get().map_or(Duration::from_nanos(16_666_667), |vsync| vsync.period);
+            let shown_at = vsync::nanos() + 2 * period.as_nanos() as i64;
+            state.layer.stamp(Some(shown_at));
+            state.layer.set_blur(regions, Some(shown_at))
         }
 
         /// A number that changes whenever the layer is replaced or resized: what was drawn
@@ -312,6 +376,10 @@ mod android {
             self.untouched = !self.is_drawn();
             self.changes += 1;
             self.mirror_layer();
+            // The new layer starts without the blur the old one had.
+            if let Err(error) = self.layer.set_blur(&self.blur, None) {
+                log::warn!("{error}");
+            }
             Ok(())
         }
 
@@ -361,8 +429,9 @@ mod android {
 
         fn create_layer(&self, name: &str, width: u32, height: u32, capture: Capture) -> Result<Layer> {
             let name = CString::new(name).map_err(|_| err!("layer name contains a NUL byte"))?;
-            let control = self.gui.create_surface(self.client, &name, width, height, capture, false)?;
-            let mut layer = Layer { gui: self.gui, transaction: self.transaction, control, surface: std::ptr::null_mut(), window: None, shown: false };
+            let control = self.gui.create_surface(self.client, &name, width, height, capture, LayerKind::Drawn)?;
+            let (gui, client, transaction) = (self.gui, self.client, self.transaction);
+            let mut layer = Layer { gui, client, transaction, control, capture, surface: std::ptr::null_mut(), window: None, shown: false, stamped: false, blur: None };
             let (surface, window) = self.gui.window(control)?;
             window.set_size(width, height)?;
             layer.surface = surface;
@@ -384,11 +453,17 @@ mod android {
 
     struct Layer {
         gui: &'static LibGui,
+        client: Ptr,
         transaction: Ptr,
         control: Ptr,
+        capture: Capture,
         surface: Ptr,
         window: Option<ANativeWindow>,
         shown: bool,
+        /// Whether the window's next buffers carry a moment to be shown at.
+        stamped: bool,
+        /// The layer the blur is asked on, once any was asked for.
+        blur: Option<Handle>,
     }
 
     impl Layer {
@@ -407,6 +482,26 @@ mod android {
             Ok(())
         }
 
+        /// The moment the window's next buffers ask to be shown at, in nanoseconds on the
+        /// system's clock; none, as soon as they can be.
+        fn stamp(&mut self, shown_at: Option<i64>) {
+            if shown_at.is_some() || self.stamped {
+                self.window().stamp(shown_at);
+                self.stamped = shown_at.is_some();
+            }
+        }
+
+        /// Asks the system for the blur under the given parts. The layer it is asked on is made
+        /// when there first is something to blur.
+        fn set_blur(&mut self, regions: &[BlurRegion], shown_at: Option<i64>) -> Result<()> {
+            let layer = match &self.blur {
+                Some(layer) => layer.as_ptr(),
+                None if regions.is_empty() => return Ok(()),
+                None => self.blur.insert(self.gui.create_blur_layer(self.client, self.transaction, self.control, self.capture)?).as_ptr(),
+            };
+            self.gui.set_blur(self.transaction, layer, regions, shown_at)
+        }
+
         /// Resizes the layer in place. Returns `false` when this Android version cannot do that
         /// and the layer has to be created again.
         fn resize(&mut self, width: u32, height: u32) -> Result<bool> {
@@ -421,6 +516,7 @@ mod android {
     impl Drop for Layer {
         fn drop(&mut self) {
             let _ = self.set_visible(false);
+            self.blur = None;
             self.window = None;
             if !self.surface.is_null() {
                 self.gui.release(self.surface);
@@ -435,7 +531,7 @@ mod android {
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 mod native {
-    use std::ffi::c_void;
+    use std::ffi::{c_int, c_void};
     use std::ptr::NonNull;
 
     use super::{FORMAT_RGBA_8888, Region};
@@ -460,6 +556,29 @@ mod native {
         fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
     }
 
+    /// The start of an `ANativeWindow` as the system lays it out, up to the call that changes
+    /// what its next buffers carry.
+    #[repr(C)]
+    struct Calls {
+        magic: i32,
+        version: i32,
+        reserved: [*mut c_void; 4],
+        inc_ref: *mut c_void,
+        dec_ref: *mut c_void,
+        flags: u32,
+        min_swap_interval: i32,
+        max_swap_interval: i32,
+        xdpi: f32,
+        ydpi: f32,
+        oem: [isize; 4],
+        set_swap_interval: *mut c_void,
+        dequeue_old: *mut c_void,
+        lock_old: *mut c_void,
+        queue_old: *mut c_void,
+        query: *mut c_void,
+        perform: unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int,
+    }
+
     pub struct ANativeWindow(NonNull<c_void>);
 
     impl ANativeWindow {
@@ -477,6 +596,13 @@ mod native {
 
         pub fn as_ptr(&self) -> *mut c_void {
             self.0.as_ptr()
+        }
+
+        /// The moment the window's next buffers ask to be shown at, in nanoseconds on the
+        /// system's clock; none, as soon as they can be.
+        pub(crate) fn stamp(&self, shown_at: Option<i64>) {
+            // `NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP`, with `NATIVE_WINDOW_TIMESTAMP_AUTO` for none.
+            unsafe { (self.0.cast::<Calls>().as_ref().perform)(self.0.as_ptr(), 7, shown_at.unwrap_or(i64::MIN)) };
         }
 
         pub fn set_size(&self, width: u32, height: u32) -> Result<()> {

@@ -20,7 +20,7 @@ pub mod window;
 pub use egui;
 #[cfg(target_os = "android")]
 pub use graphics::Graphics;
-pub use graphics::{GraphicsApi, Texture};
+pub use graphics::{Blur, GraphicsApi, Texture};
 pub use input::{Keyboard, Language, Touch};
 #[cfg(target_os = "android")]
 pub use utils::logger;

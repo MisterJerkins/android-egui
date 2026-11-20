@@ -1,6 +1,7 @@
 //! Drawing. [`Graphics::create`] picks a graphics API for the window, and the [`Graphics`] it
 //! returns runs the frames: input in, egui's picture out to the window.
 
+mod blur;
 #[cfg(target_os = "android")]
 mod opengl;
 mod software;
@@ -15,6 +16,7 @@ use egui::TextureId;
 pub use android::Graphics;
 #[cfg(target_os = "android")]
 pub(crate) use android::{Backend, Frame};
+pub use blur::Blur;
 pub use texture::Texture;
 
 /// The graphics API to draw with.
@@ -69,7 +71,7 @@ mod android {
     use egui::{ClippedPrimitive, Context, Pos2, RawInput, Rect, TexturesDelta, ViewportCommand, ViewportId, vec2};
 
     use super::texture::{self, Texture};
-    use super::{GraphicsApi, opengl, software, texture_key, vsync, vulkan};
+    use super::{Blur, GraphicsApi, opengl, software, texture_key, vulkan};
     use crate::input::{self, Feed};
     use crate::utils::{self, HASH_SEED};
     use crate::window::{ANativeWindow, Display, NativeWindow};
@@ -137,6 +139,7 @@ mod android {
         fingerprint: u64,
         running: bool,
         input: Option<Feed>,
+        blur: Blur,
     }
 
     impl Graphics {
@@ -164,6 +167,7 @@ mod android {
                 fingerprint: 0,
                 running: true,
                 input: None,
+                blur: Blur::new(window.can_blur()),
             })
         }
 
@@ -181,6 +185,7 @@ mod android {
 
             let display = self.window.display();
             let raw = self.take_input(display);
+            self.blur.new_frame();
             let mut unused = Rect::NOTHING;
             let input = &self.input;
             let mut output = self.context.run_ui(raw, |root| {
@@ -201,8 +206,16 @@ mod android {
                 input.publish(&self.context, display, unused, output.pixels_per_point);
             }
 
-            let primitives = self.context.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
             let size = [display.width, display.height];
+            // Before the frame goes to the window, which then has the two shown together.
+            let blurred = self.blur.collect(&self.context, output.pixels_per_point, size);
+            if let Err(error) = self.window.set_blur(&blurred) {
+                // The interface is all there without it: the reason is told and the blur given up.
+                log::warn!("{error}");
+                self.blur.give_up();
+            }
+
+            let primitives = self.context.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
             let fingerprint = fingerprint(&primitives, size);
             if fingerprint != self.fingerprint || !output.textures_delta.is_empty() {
                 let (backend, pixels_per_point, textures) = (&self.backend, output.pixels_per_point, &mut output.textures_delta);
@@ -210,12 +223,17 @@ mod android {
                 self.fingerprint = fingerprint;
             }
 
-            self.window.set_visible(!primitives.is_empty())?;
+            self.window.set_visible(!primitives.is_empty() || !blurred.is_empty())?;
             Ok(self.running)
         }
 
         pub fn context(&self) -> &Context {
             &self.context
+        }
+
+        /// The screen behind the interface, blurred: behind its windows, or behind any rectangle.
+        pub fn blur(&self) -> Blur {
+            self.blur.clone()
         }
 
         /// The graphics API in use, by name.
@@ -277,9 +295,20 @@ mod android {
         }
 
         fn wait(&mut self) -> Result<()> {
-            // Frames follow the display's refresh, and where that is not known they come four
-            // milliseconds apart at the least.
-            let earliest = self.frame_at + vsync::period().or(self.window.refresh_period()).unwrap_or(Duration::from_millis(4));
+            // One frame for each of the display's: a frame begins once the display has taken its
+            // turn after the frame before began. Begun sooner it would wait in the window's queue,
+            // and hold back every frame after it for as long. Without the display's rhythm to go
+            // by, no display is faster than a frame in four milliseconds. Only frames that come
+            // one after another are held to that rhythm, so only then is the system asked for it.
+            let following = self.frame_at.elapsed() < Duration::from_millis(100);
+            let earliest = following.then(|| self.window.vsync()).flatten().and_then(|vsync| {
+                let period = vsync.period.as_nanos();
+                match self.frame_at.checked_duration_since(vsync.at) {
+                    Some(since) => vsync.at.checked_add(Duration::from_nanos(((since.as_nanos() / period + 1) * period) as u64)),
+                    None => vsync.at.checked_sub(Duration::from_nanos((vsync.at.duration_since(self.frame_at).as_nanos() / period * period) as u64)),
+                }
+            });
+            let earliest = earliest.unwrap_or(self.frame_at + Duration::from_millis(4));
             let mut pending = false;
             loop {
                 let now = Instant::now();
@@ -340,70 +369,5 @@ mod android {
             }
         }
         hash
-    }
-}
-
-/// The display's refresh period as the NDK's choreographer reports it.
-#[cfg(target_os = "android")]
-#[allow(unsafe_code)]
-mod vsync {
-    use std::ffi::{c_int, c_void};
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    use crate::utils::{self, Library};
-
-    static PERIOD_NANOS: AtomicU64 = AtomicU64::new(0);
-
-    type Prepare = unsafe extern "C" fn(c_int) -> *mut c_void;
-    type PollOnce = unsafe extern "C" fn(c_int, *mut c_int, *mut c_int, *mut *mut c_void) -> c_int;
-    type GetInstance = unsafe extern "C" fn() -> *mut c_void;
-    type Callback = unsafe extern "C" fn(i64, *mut c_void);
-    type Register = unsafe extern "C" fn(*mut c_void, Callback, *mut c_void);
-
-    unsafe extern "C" fn on_refresh_rate(period_nanos: i64, _data: *mut c_void) {
-        PERIOD_NANOS.store(period_nanos.max(0) as u64, Ordering::Relaxed);
-    }
-
-    /// The display's vsync period, tracked through the NDK choreographer (Android 11+).
-    pub fn period() -> Option<Duration> {
-        static STARTED: OnceLock<bool> = OnceLock::new();
-        if !*STARTED.get_or_init(start) {
-            return None;
-        }
-        match PERIOD_NANOS.load(Ordering::Relaxed) {
-            0 => None,
-            nanos => Some(Duration::from_nanos(nanos)),
-        }
-    }
-
-    fn start() -> bool {
-        let Ok(android) = Library::open(c"libandroid.so") else {
-            return false;
-        };
-        let functions = unsafe {
-            (
-                android.func::<Prepare>(c"ALooper_prepare"),
-                android.func::<PollOnce>(c"ALooper_pollOnce"),
-                android.func::<GetInstance>(c"AChoreographer_getInstance"),
-                android.func::<Register>(c"AChoreographer_registerRefreshRateCallback"),
-            )
-        };
-        let (Some(prepare), Some(poll_once), Some(instance), Some(register)) = functions else {
-            return false;
-        };
-        let watch = move || unsafe {
-            prepare(0);
-            let choreographer = instance();
-            if choreographer.is_null() {
-                return;
-            }
-            register(choreographer, on_refresh_rate, std::ptr::null_mut());
-            loop {
-                poll_once(-1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
-            }
-        };
-        utils::spawn("vsync", watch).is_ok()
     }
 }
